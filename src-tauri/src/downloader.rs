@@ -151,12 +151,24 @@ pub fn parse_error_line(line: &str) -> Option<String> {
     }
 }
 
+/// A lone path line with no `[prefix]` and one path-shaped thing on it is
+/// what `--print after_move:filepath` emits — the final file on disk.
+pub fn parse_final_file(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('[') {
+        return None;
+    }
+    Some(t.to_string())
+}
+
 /// Build the full argv for one download, per PLAN.md locked flags.
 pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<String> {
     let mut args = vec![
         "--newline".to_string(),
         "--impersonate".to_string(),
         "chrome".to_string(),
+        "--print".to_string(),
+        "after_move:filepath".to_string(),
     ];
     if let Some(file) = &config.cookie_file {
         args.extend(["--cookies".to_string(), file.clone()]);
@@ -176,6 +188,41 @@ pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<S
     }
     args.push(url.to_string());
     args
+}
+
+#[cfg(test)]
+mod final_file_tests {
+    use super::*;
+
+    fn config() -> EngineConfig {
+        EngineConfig {
+            engine_path: PathBuf::from("/fake/engine"),
+            save_path: None,
+            cookie_file: None,
+        }
+    }
+
+    #[test]
+    fn args_ask_for_final_filepath() {
+        let args = build_args(&config(), "u", DownloadMode::Audio);
+        let i = args.iter().position(|a| a == "--print").unwrap();
+        assert_eq!(args[i + 1], "after_move:filepath");
+    }
+
+    #[test]
+    fn lone_path_line_is_final_file() {
+        assert_eq!(
+            parse_final_file("/media/music/song.mp3"),
+            Some("/media/music/song.mp3".to_string())
+        );
+    }
+
+    #[test]
+    fn engine_lines_are_not_final_file() {
+        assert_eq!(parse_final_file("[download] Destination: /a/b.mp4"), None);
+        assert_eq!(parse_final_file(""), None);
+        assert_eq!(parse_final_file("[youtube] abc: fetching"), None);
+    }
 }
 
 #[cfg(test)]
