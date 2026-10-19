@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import DownloadTab from "./components/DownloadTab";
 
 export interface Settings {
@@ -18,6 +19,24 @@ function SettingsPanel({
 }) {
   const [draft, setDraft] = useState<Settings>(settings);
 
+  const browseSavePath = async () => {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked === "string") {
+      setDraft({ ...draft, save_path: picked });
+    }
+  };
+
+  const browseCookies = async () => {
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: "cookies", extensions: ["txt"] }],
+    });
+    if (typeof picked === "string") {
+      await invoke("set_cookie_file", { path: picked });
+      setDraft({ ...draft, cookie_file: picked });
+    }
+  };
+
   return (
     <section data-testid="settings-panel">
       <label>
@@ -27,6 +46,9 @@ function SettingsPanel({
           onChange={(e) => setDraft({ ...draft, save_path: e.target.value })}
         />
       </label>
+      <button aria-label="Browse save path" onClick={browseSavePath}>
+        Browse…
+      </button>
       <label>
         Cookies file
         <input
@@ -34,6 +56,9 @@ function SettingsPanel({
           onChange={(e) => setDraft({ ...draft, cookie_file: e.target.value })}
         />
       </label>
+      <button aria-label="Browse cookies" onClick={browseCookies}>
+        Browse…
+      </button>
       <button onClick={() => onSave(draft)}>Save</button>
       <button onClick={() => setDraft(settings)}>Cancel</button>
     </section>

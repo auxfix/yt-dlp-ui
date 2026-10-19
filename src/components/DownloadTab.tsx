@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 type Mode = "audio" | "video";
 
@@ -27,6 +28,7 @@ interface FinishedPayload {
   ok: boolean;
   message: string;
   stderrTail: string;
+  cookieIssue: boolean;
 }
 
 type Payload = StartPayload | ProgressPayload | FinishedPayload;
@@ -37,6 +39,7 @@ export default function DownloadTab() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState<{ message: string; stderrTail: string } | null>(null);
+  const [cookieBanner, setCookieBanner] = useState(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -47,6 +50,7 @@ export default function DownloadTab() {
           setStatus("running");
           setProgress(null);
           setError(null);
+          setCookieBanner(false);
           break;
         case "progress":
           setProgress({ pct: p.pct, speed: p.speed, eta: p.eta });
@@ -55,6 +59,7 @@ export default function DownloadTab() {
           setStatus(p.ok ? "done" : "error");
           if (!p.ok) {
             setError({ message: p.message, stderrTail: p.stderrTail });
+            setCookieBanner(p.cookieIssue);
           }
           break;
       }
@@ -71,6 +76,18 @@ export default function DownloadTab() {
     invoke("start_download", { url: url.trim(), mode }).catch((e) => {
       setError({ message: String(e), stderrTail: String(e) });
     });
+  };
+
+  const pickCookieFile = async () => {
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: "cookies.txt", extensions: ["txt"] }],
+    });
+    if (typeof picked !== "string") {
+      return; // user cancelled — banner stays
+    }
+    await invoke("set_cookie_file", { path: picked });
+    setCookieBanner(false);
   };
 
   const running = status === "running";
@@ -123,6 +140,15 @@ export default function DownloadTab() {
 
       {error && (
         <div role="alert">
+          {cookieBanner && (
+            <div className="cookie-banner" data-testid="cookie-banner">
+              <p>
+                Couldn't read Chrome cookies. Close Chrome and retry, or pick
+                your cookies.txt (exported once, stored and reused).
+              </p>
+              <button onClick={pickCookieFile}>Pick cookies.txt</button>
+            </div>
+          )}
           <p className="error-line">{error.message}</p>
           <details>
             <summary>Full engine output</summary>

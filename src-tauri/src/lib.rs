@@ -49,6 +49,15 @@ fn set_settings(state: State<AppState>, settings: Settings) {
 }
 
 #[tauri::command]
+fn set_cookie_file(state: State<AppState>, path: String) {
+    let store = state.store.lock().unwrap();
+    // merge over current settings so save_path survives
+    let mut current = store.load();
+    current.cookie_file = Some(path);
+    store.save(&current);
+}
+
+#[tauri::command]
 fn start_download(
     app: AppHandle,
     state: State<AppState>,
@@ -156,6 +165,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
+            set_cookie_file,
             start_download
         ])
         .run(tauri::generate_context!())
