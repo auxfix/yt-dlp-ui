@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import DownloadTab from "./components/DownloadTab";
 
 export interface Settings {
   save_path: string | null;
@@ -82,7 +83,9 @@ export default function App() {
       )}
 
       {tab === "download" ? (
-        <div role="tabpanel">Download tab</div>
+        <div role="tabpanel">
+          <DownloadTab />
+        </div>
       ) : (
         <div role="tabpanel">History tab</div>
       )}

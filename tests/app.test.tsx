@@ -25,7 +25,7 @@ describe("yt-ui shell", () => {
     await renderApp();
     expect(screen.getByRole("tab", { name: "Download" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
-    expect(screen.getByRole("tabpanel")).toHaveTextContent("Download tab");
+    expect(screen.getByLabelText(/url/i)).toBeInTheDocument();
   });
 
   it("switches to History tab", async () => {
