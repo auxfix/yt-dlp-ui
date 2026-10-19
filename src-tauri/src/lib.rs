@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use downloader::{
-    build_args, parse_error_line, parse_progress_line, run_engine, DownloadMode, EngineConfig,
+    build_args, classify_is_cookie_issue, parse_error_line, parse_progress_line, run_engine,
+    DownloadMode, EngineConfig,
 };
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
@@ -31,6 +32,7 @@ enum DownloadEvent {
         ok: bool,
         message: String,
         stderr_tail: String,
+        cookie_issue: bool,
     },
 }
 
@@ -108,6 +110,7 @@ fn start_download(
                         ok: false,
                         message: format!("could not start engine: {e}"),
                         stderr_tail: String::new(),
+                        cookie_issue: false,
                     },
                 );
                 return;
@@ -123,6 +126,7 @@ fn start_download(
                 } else {
                     last_error.unwrap_or_else(|| "download failed".to_string())
                 },
+                cookie_issue: classify_is_cookie_issue(&handle.stderr_tail),
                 stderr_tail: handle.stderr_tail,
             },
         );
@@ -135,6 +139,7 @@ fn start_download(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let config_dir = app

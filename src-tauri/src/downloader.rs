@@ -111,6 +111,20 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
     })
 }
 
+/// True when a failure stdout tail indicates a YouTube-cookie problem
+/// (browser cookie reading failed, or the bot-check wall appeared).
+pub fn classify_is_cookie_issue(stderr_tail: &str) -> bool {
+    const MARKERS: [&str; 4] = [
+        "could not copy chrome cookie database",
+        "failed to decrypt",
+        "unable to decrypt",
+        "confirm you're not a bot",
+    ];
+    MARKERS
+        .iter()
+        .any(|m| stderr_tail.to_ascii_lowercase().contains(m))
+}
+
 /// Peel `ERROR: …` down to the human-readable message (bot-check text etc).
 pub fn parse_error_line(line: &str) -> Option<String> {
     let mut msg = line.strip_prefix("ERROR: ")?.trim().to_string();
@@ -255,6 +269,41 @@ mod runner_tests {
     }
 }
 
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn chrome_cookie_db_copy_failure_is_cookie_issue() {
+        assert!(classify_is_cookie_issue(
+            "ERROR: could not copy chrome cookie database: database is locked"
+        ));
+    }
+
+    #[test]
+    fn decryption_failure_is_cookie_issue() {
+        assert!(classify_is_cookie_issue(
+            "ERROR: [youtube] abc: failed to decrypt with DPAPI: unable to determine "
+        ));
+    }
+
+    #[test]
+    fn bot_check_is_cookie_issue() {
+        assert!(classify_is_cookie_issue(
+            "Sign in to confirm you're not a bot"
+        ));
+    }
+
+    #[test]
+    fn generic_http_error_is_not() {
+        assert!(!classify_is_cookie_issue(
+            "ERROR: HTTP Error 404: Not Found"
+        ));
+        assert!(!classify_is_cookie_issue(""));
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod args_tests {
     use super::*;
