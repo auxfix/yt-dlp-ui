@@ -28,11 +28,14 @@ mkdir -p "$dest"
 URL() { printf '%s' "$1"; }
 
 # yt-dlp — nightly channel (see PLAN.md: stable is stale-by-design)
+# Store as plain `yt-dlp`/`yt-dlp.exe`: that is the name engine resolution
+# and the updater both expect in app-data / bundled resources.
 if [ "$target" = "windows" ]; then ytdlp_asset="yt-dlp.exe"; else ytdlp_asset="yt-dlp_linux"; fi
+ytdlp_name="${ytdlp_asset%_linux}"  # yt-dlp_linux -> yt-dlp
 echo "- yt-dlp ($ytdlp_asset nightly)"
-curl -fsSL -o "$dest/$ytdlp_asset" \
+curl -fsSL -o "$dest/$ytdlp_name" \
   "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/$ytdlp_asset"
-if [ "$target" != "windows" ]; then chmod +x "$dest/$ytdlp_asset"; fi
+if [ "$target" != "windows" ]; then chmod +x "$dest/$ytdlp_name"; fi
 
 # ffmpeg + ffprobe (yt-dlp's own builds)
 if [ "$target" = "windows" ]; then

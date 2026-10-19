@@ -25,25 +25,30 @@ export default function HistoryTab() {
   }, []);
 
   return (
-    <div>
-      {entries === null && <div>Loading…</div>}
+    <div className={entries !== null && entries.length > 0 ? "history" : undefined}>
+      {entries === null && <div className="history-empty">Loading…</div>}
       {entries !== null && entries.length === 0 && (
-        <div>No downloads yet</div>
+        <div className="history-empty">No downloads yet</div>
       )}
       {entries !== null && entries.length > 0 && (
-        <ul data-testid="history-list">
+        <ul className="history-list" data-testid="history-list">
           {entries.map((e, i) => (
-            <li key={i} data-testid={`entry-${i}`}>
-              <span data-testid={`icon-${e.mode}`}>
+            <li
+              key={i}
+              className={`history-row ${e.ok ? "ok" : "failed"}`}
+              data-testid={`entry-${i}`}
+            >
+              <span className="status-dot" data-testid={e.ok ? "status-ok" : "status-fail"} />
+              <span aria-hidden data-testid={`icon-${e.mode}`}>
                 {e.mode === "audio" ? "🎵" : "🎬"}
-              </span>{" "}
-              <span title={`${e.url}${e.filePath ? `\n${e.filePath}` : ""}`}>
-                {e.title}
-              </span>{" "}
-              <span>{fmtTime(e.ts)}</span>{" "}
-              <span data-testid={e.ok ? "status-ok" : "status-fail"}>
-                {e.ok ? "✓" : "✗"}
               </span>
+              <span
+                className="title"
+                title={`${e.url}${e.filePath ? `\n${e.filePath}` : ""}`}
+              >
+                {e.title}
+              </span>
+              <span className="when">{fmtTime(e.ts)}</span>
             </li>
           ))}
         </ul>

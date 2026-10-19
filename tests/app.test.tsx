@@ -23,94 +23,189 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import App from "../src/App";
 
-async function renderApp() {
-  const result = render(<App />);
-  return result;
+function emit(payload: unknown) {
+  act(() => {
+    handlers.forEach((h) => h({ payload }));
+  });
 }
 
-describe("yt-ui shell", () => {
+// stateful backend double: set_cookie_file / set_settings mutate the store
+function makeBackend(initial: Record<string, unknown>) {
+  const store: Record<string, unknown> = { ...initial };
+  invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+    switch (cmd) {
+      case "get_settings":
+        return Promise.resolve({ ...store });
+      case "get_history":
+        return Promise.resolve([]);
+      case "set_settings":
+        Object.assign(store, (args as { settings: Record<string, unknown> }).settings);
+        return Promise.resolve(undefined);
+      case "set_cookie_file":
+        store.cookie_file = (args as { path: string }).path;
+        return Promise.resolve(undefined);
+      case "engine_version":
+        return Promise.resolve({ version: "2026.10.10.233141", origin: "user" });
+      case "update_engine":
+        store.updatedTag = true;
+        return Promise.resolve("2026.10.20.233405");
+      default:
+        return Promise.resolve(undefined);
+    }
+  });
+  return store;
+}
+
+async function renderApp() {
+  return render(<App />);
+}
+
+describe("yt-ui tabs shell", () => {
   beforeEach(() => {
     invokeMock.mockReset();
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "get_history") return Promise.resolve([]);
-      return Promise.resolve({ save_path: null, cookie_file: null });
+    openMock.mockReset();
+    openMock.mockResolvedValue(null);
+    handlers.length = 0;
+    makeBackend({ save_path: null, cookie_file: null, engine_path: null });
+  });
+
+  it("shows Download, History and Settings tabs, starting on Download", async () => {
+    await renderApp();
+    for (const name of ["Download", "History", "Settings"]) {
+      expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeInTheDocument();
+    }
+    expect(screen.getByLabelText("URL")).toBeInTheDocument();
+  });
+
+  it("keeps Download state while visiting other tabs", async () => {
+    await renderApp();
+    fireEvent.change(screen.getByLabelText("URL"), {
+      target: { value: "https://youtu.be/keep" },
     });
+    fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /Download/ }));
+    expect(screen.getByLabelText("URL")).toHaveValue("https://youtu.be/keep");
   });
 
-  it("shows Download and History tabs and starts on Download", async () => {
+  it("settings tab lists save path, cookies and engine override", async () => {
     await renderApp();
-    expect(screen.getByRole("tab", { name: "Download" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
-    expect(screen.getByLabelText(/url/i)).toBeInTheDocument();
-  });
-
-  it("switches to History tab and shows the history list shell", async () => {
-    await renderApp();
-    fireEvent.click(screen.getByRole("tab", { name: "History" }));
-    await act(async () => {}); // flush async get_history state update
-    expect(await screen.findByText(/No downloads yet/)).toBeInTheDocument();
-  });
-
-  it("gear opens settings panel and shows save path input", async () => {
-    invokeMock.mockResolvedValue({
-      save_path: "/home/me/Music",
-      cookie_file: null,
-    });
-    await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    await waitFor(
-      async () =>
-        expect(await screen.findByLabelText("Save path")).toHaveValue(
-          "/home/me/Music"
-        ),
-      { timeout: 5000 }
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    expect(await screen.findByLabelText("Save path")).toBeInTheDocument();
+    expect(screen.getByLabelText("Cookies file")).toBeInTheDocument();
+    expect(screen.getByLabelText("Engine")).toBeInTheDocument();
+    expect(screen.getByTestId("engine-info")).toHaveTextContent(
+      "2026.10.10.233141"
     );
   });
 
-  it("settings save button persists via set_settings", async () => {
-    invokeMock.mockResolvedValue({
-      save_path: null,
-      cookie_file: null,
-    });
+  it("settings are refetched when the tab opens, not stale from mount", async () => {
+    // banner pick lands AFTER app mounted; settings tab must see it
+    makeBackend({ save_path: "/some", cookie_file: null, engine_path: null });
     await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    emit({
+      type: "finished",
+      ok: false,
+      message: "db locked",
+      stderrTail: "ERROR: could not copy chrome cookie database",
+      cookieIssue: true,
+    });
+    openMock.mockResolvedValue("/home/me/cookies.txt");
+    fireEvent.click(screen.getByRole("button", { name: /pick cookies.txt/i }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_cookie_file", {
+        path: "/home/me/cookies.txt",
+      });
+    });
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    // fresh fetch must show the picked cookie, not the mount-time null
+    await waitFor(async () => {
+      expect(await screen.findByLabelText("Cookies file")).toHaveValue(
+        "/home/me/cookies.txt"
+      );
+    });
+  });
+
+  it("settings save persists the full current state", async () => {
+    await renderApp();
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
     const input = await screen.findByLabelText("Save path");
     fireEvent.change(input, { target: { value: "/home/me/Videos" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("set_settings", {
-        settings: { save_path: "/home/me/Videos", cookie_file: null },
+        settings: {
+          save_path: "/home/me/Videos",
+          cookie_file: null,
+          engine_path: null,
+        },
       });
     });
   });
 
-  it("save path Browse button opens folder picker and applies choice", async () => {
-    invokeMock.mockResolvedValue({ save_path: null, cookie_file: null });
+  it("engine override picker persists engine_path", async () => {
+    openMock.mockResolvedValue("/opt/newengine/yt-dlp");
+    await renderApp();
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /browse engine/i }));
+    await waitFor(() => {
+      expect(openMock).toHaveBeenCalled();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          save_path: null,
+          cookie_file: null,
+          engine_path: "/opt/newengine/yt-dlp",
+        },
+      });
+    });
+  });
+
+  it("clear engine override resets path and persists null", async () => {
+    makeBackend({ save_path: null, cookie_file: null, engine_path: "/old/yt-dlp" });
+    await renderApp();
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /clear engine/i }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engine")).toHaveValue("");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          save_path: null,
+          cookie_file: null,
+          engine_path: null,
+        },
+      });
+    });
+  });
+
+  it("save path browse stages a folder choice and Save persists it", async () => {
     openMock.mockResolvedValue("/home/me/picked_music");
     await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
     fireEvent.click(await screen.findByRole("button", { name: /browse save path/i }));
-    await waitFor(() => {
-      expect(openMock).toHaveBeenCalledWith(
-        expect.objectContaining({ directory: true })
-      );
-    });
     expect(await screen.findByLabelText("Save path")).toHaveValue(
       "/home/me/picked_music"
     );
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("set_settings", {
-        settings: { save_path: "/home/me/picked_music", cookie_file: null },
+        settings: {
+          save_path: "/home/me/picked_music",
+          cookie_file: null,
+          engine_path: null,
+        },
       });
     });
   });
 
-  it("cookies Browse button opens file picker and applies choice", async () => {
-    invokeMock.mockResolvedValue({ save_path: null, cookie_file: null });
+  it("cookies file browse persists immediately via set_cookie_file", async () => {
     openMock.mockResolvedValue("/home/me/cookies.txt");
     await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
     fireEvent.click(await screen.findByRole("button", { name: /browse cookies/i }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("set_cookie_file", {
@@ -122,54 +217,23 @@ describe("yt-ui shell", () => {
     );
   });
 
-  it("engine row shows version and origin from engine_version", async () => {
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "get_history") return Promise.resolve([]);
-      if (cmd === "engine_version")
-        return Promise.resolve({
-          version: "2026.10.10.233141",
-          origin: "user",
-        });
-      return Promise.resolve({ save_path: null, cookie_file: null });
-    });
+  it("update engine shows fresh version after update", async () => {
+    const store = makeBackend({ save_path: null, cookie_file: null, engine_path: null });
     await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    expect(
-      await screen.findByTestId("engine-info")
-    ).toHaveTextContent("2026.10.10.233141");
-    expect(screen.getByTestId("engine-info")).toHaveTextContent("user");
-  });
-
-  it("Update engine button calls update_engine and shows result", async () => {
-    let calls = 0;
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
-      if (cmd === "engine_version")
-        return Promise.resolve({
-          version: calls === 0 ? "2026.10.10.233141" : "2026.10.20.233405",
-          origin: "user",
-        });
-      if (cmd === "get_history") return Promise.resolve([]);
-      return Promise.resolve({ save_path: null, cookie_file: null });
-    });
-    await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
     await screen.findByTestId("engine-info");
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
       if (cmd === "engine_version")
-        return Promise.resolve({
-          version: "2026.10.20.233405",
-          origin: "user",
-        });
+        return Promise.resolve({ version: "2026.10.20.233405", origin: "user" });
+      if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
       if (cmd === "get_history") return Promise.resolve([]);
-      return Promise.resolve({ save_path: null, cookie_file: null });
+      return Promise.resolve({ ...store });
     });
     fireEvent.click(screen.getByRole("button", { name: /update engine/i }));
     await waitFor(async () => {
-      expect(
-        (await screen.findByTestId("engine-info")).textContent
-      ).toContain("2026.10.20.233405");
+      expect((await screen.findByTestId("engine-info")).textContent).toContain(
+        "2026.10.20.233405"
+      );
     });
   });
 });

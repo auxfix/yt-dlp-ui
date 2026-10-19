@@ -91,55 +91,76 @@ export default function DownloadTab() {
   };
 
   const running = status === "running";
+  const pct = progress?.pct ?? null;
 
   return (
-    <div>
-      <label>
-        URL
+    <div className="download">
+      <div className="card">
         <input
+          className="url-input"
+          aria-label="URL"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://www.youtube.com/..."
+          placeholder="Paste a YouTube link…"
+          spellCheck={false}
         />
-      </label>
-      <label>
-        <input
-          type="radio"
-          checked={mode === "audio"}
-          onChange={() => setMode("audio")}
-        />
-        mp3
-      </label>
-      <label>
-        <input
-          type="radio"
-          checked={mode === "video"}
-          onChange={() => setMode("video")}
-        />
-        video
-      </label>
-      <button onClick={start} disabled={running || !url.trim()}>
-        Download
-      </button>
+
+        <div className="mode-toggle" role="radiogroup" aria-label="Mode">
+          <button
+            className={mode === "audio" ? "pill active" : "pill"}
+            aria-label="mp3"
+            aria-pressed={mode === "audio"}
+            onClick={() => setMode("audio")}
+          >
+            🎵 mp3
+          </button>
+          <button
+            className={mode === "video" ? "pill active" : "pill"}
+            aria-label="video"
+            aria-pressed={mode === "video"}
+            onClick={() => setMode("video")}
+          >
+            🎬 video
+          </button>
+        </div>
+
+        <button className="primary download-btn" onClick={start} disabled={running || !url.trim()}>
+          {running ? (
+            <>
+              <span className="spin" aria-hidden>⭯</span> Downloading…
+            </>
+          ) : (
+            <>
+              <span aria-hidden>⬇</span> Download
+            </>
+          )}
+        </button>
+      </div>
 
       {running && (
-        <div data-testid="run-status">
-          <span>Downloading…</span>
-          {progress && (
-            <span>
-              {" "}
-              {progress.pct.toFixed(1)}%
-              {progress.speed ? ` · ${progress.speed}` : ""}
-              {progress.eta ? ` · ETA ${progress.eta}` : ""}
-            </span>
-          )}
+        <div data-testid="run-status" className="card progress-card">
+          <div className="progress-track">
+            <div
+              className={pct === null ? "progress-fill indeterminate" : "progress-fill"}
+              style={pct === null ? undefined : { width: `${Math.min(pct, 100)}%` }}
+            />
+          </div>
+          <div className="progress-meta">
+            <span className="pct">{pct === null ? "starting…" : `${pct.toFixed(1)}%`}</span>
+            {progress?.speed && <span className="meta-chip">{progress.speed}</span>}
+            {progress?.eta && <span className="meta-chip">ETA {progress.eta}</span>}
+          </div>
         </div>
       )}
 
-      {status === "done" && <div>Done</div>}
+      {status === "done" && (
+        <div className="card done-card">
+          ✅ <span>Done</span> — saved to your folder
+        </div>
+      )}
 
       {error && (
-        <div role="alert">
+        <div className="card error-card" role="alert">
           {cookieBanner && (
             <div className="cookie-banner" data-testid="cookie-banner">
               <p>
@@ -149,7 +170,10 @@ export default function DownloadTab() {
               <button onClick={pickCookieFile}>Pick cookies.txt</button>
             </div>
           )}
-          <p className="error-line">{error.message}</p>
+          <div className="error-head">
+            <span aria-hidden className="error-icon">⚠️</span>
+            <p className="error-line">{error.message}</p>
+          </div>
           <details>
             <summary>Full engine output</summary>
             <pre>{error.stderrTail}</pre>

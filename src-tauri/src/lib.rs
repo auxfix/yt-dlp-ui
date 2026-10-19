@@ -238,6 +238,19 @@ fn start_download(
 
         let mut cmd = std::process::Command::new(&config.engine_path);
         cmd.args(&args);
+        // bundled siblings (ffmpeg/ffprobe/deno) must be findable by the
+        // engine subprocesses; Tauri app bundles don't carry them on PATH
+        if let Some(dir) = &config.engine_dir {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            let current = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![std::path::PathBuf::from(dir)];
+            paths.extend(std::env::split_paths(&current));
+            cmd.env(
+                "PATH",
+                std::env::join_paths(&paths)
+                    .unwrap_or_else(|_| std::ffi::OsString::from(format!("{dir}{sep}"))),
+            );
+        }
         let result = run_engine(&mut cmd, &mut |line| {
             if let Some(p) = parse_progress_line(line) {
                 let _ = app.emit(

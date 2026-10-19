@@ -41,6 +41,7 @@ describe("History tab", () => {
     });
     expect(screen.getByText("Song One")).toBeInTheDocument();
     expect(screen.getByText("https://youtu.be/b")).toBeInTheDocument();
+    // mode icon contract stays: data-testid icon-<mode>
     expect(screen.getAllByTestId(/icon-/)).toHaveLength(2);
     expect(screen.getByTestId("icon-audio")).toBeInTheDocument();
     expect(screen.getByTestId("icon-video")).toBeInTheDocument();

@@ -27,7 +27,18 @@ pub fn run_engine(
     on_line: &mut dyn FnMut(&str),
 ) -> std::io::Result<EngineResult> {
     use std::process::Stdio;
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // freshly-written scripts can transiently refuse exec with ETXTBSY
+    // (write-exclusion lingers a beat after fs::write returns); retry briefly
+    let mut child = loop {
+        match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(child) => break child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
