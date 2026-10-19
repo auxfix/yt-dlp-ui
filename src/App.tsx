@@ -1,51 +1,91 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+export interface Settings {
+  save_path: string | null;
+  cookie_file: string | null;
+}
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+type Tab = "download" | "history";
+
+function SettingsPanel({
+  settings,
+  onSave,
+}: {
+  settings: Settings;
+  onSave: (s: Settings) => void;
+}) {
+  const [draft, setDraft] = useState<Settings>(settings);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
+    <section data-testid="settings-panel">
+      <label>
+        Save path
         <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+          value={draft.save_path ?? ""}
+          onChange={(e) => setDraft({ ...draft, save_path: e.target.value })}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      </label>
+      <label>
+        Cookies file
+        <input
+          value={draft.cookie_file ?? ""}
+          onChange={(e) => setDraft({ ...draft, cookie_file: e.target.value })}
+        />
+      </label>
+      <button onClick={() => onSave(draft)}>Save</button>
+      <button onClick={() => setDraft(settings)}>Cancel</button>
+    </section>
   );
 }
 
-export default App;
+export default function App() {
+  const [tab, setTab] = useState<Tab>("download");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<Settings>({
+    save_path: null,
+    cookie_file: null,
+  });
+
+  useEffect(() => {
+    invoke<Settings>("get_settings")
+      .then((s) => setSettings(s))
+      .catch(() => {
+        /* fresh frontend dev without backend; defaults stand */
+      });
+  }, []);
+
+  const saveSettings = (s: Settings) => {
+    setSettings(s);
+    invoke("set_settings", { settings: s }).catch(() => {
+      /* surface later when commands carry errors */
+    });
+    setSettingsOpen(false);
+  };
+
+  return (
+    <main>
+      <nav>
+        <button role="tab" aria-selected={tab === "download"} onClick={() => setTab("download")}>
+          Download
+        </button>
+        <button role="tab" aria-selected={tab === "history"} onClick={() => setTab("history")}>
+          History
+        </button>
+        <button aria-label="Settings" onClick={() => setSettingsOpen((o) => !o)}>
+          ⚙ Settings
+        </button>
+      </nav>
+
+      {settingsOpen && (
+        <SettingsPanel settings={settings} onSave={saveSettings} />
+      )}
+
+      {tab === "download" ? (
+        <div role="tabpanel">Download tab</div>
+      ) : (
+        <div role="tabpanel">History tab</div>
+      )}
+    </main>
+  );
+}
