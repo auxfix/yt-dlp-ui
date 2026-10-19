@@ -1,0 +1,331 @@
+//! yt-dlp engine plumbing: arg building, `--newline` progress parsing, and
+//! subprocess running. Pure pieces are unit-tested; the runner is exercised
+//! against a fixture script, not a real yt-dlp.
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::Command;
+
+pub static STDERR_TAIL_LIMIT: usize = 4000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DownloadMode {
+    Audio,
+    Video,
+}
+
+#[derive(Debug)]
+pub struct EngineResult {
+    pub ok: bool,
+    pub stderr_tail: String,
+}
+
+/// Run the engine process: stream stdout line-by-line into `on_line`,
+/// capture the stderr tail, and report the exit status.
+pub fn run_engine(
+    cmd: &mut Command,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<EngineResult> {
+    use std::process::Stdio;
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let stderr_handle = std::thread::spawn(move || {
+        let mut tail = String::new();
+        for line in BufReader::new(stderr).lines() {
+            if let Ok(line) = line {
+                tail.push_str(&line);
+                tail.push('\n');
+                let excess = tail.len().saturating_sub(STDERR_TAIL_LIMIT);
+                if excess > 0 {
+                    // keep the most recent bytes
+                    tail = tail[excess..].to_string();
+                }
+            }
+        }
+        tail
+    });
+
+    for line in BufReader::new(stdout).lines() {
+        if let Ok(line) = line {
+            on_line(&line);
+        }
+    }
+    let status = child.wait()?;
+
+    Ok(EngineResult {
+        ok: status.success(),
+        stderr_tail: stderr_handle.join().unwrap_or_default(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub engine_path: PathBuf,
+    pub save_path: Option<String>,
+    pub cookie_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Progress {
+    pub pct: f64,
+    pub speed: Option<String>,
+    pub eta: Option<String>,
+}
+
+/// Pull `pct`, `speed`, `eta` out of one yt-dlp `--newline` stdout line.
+pub fn parse_progress_line(line: &str) -> Option<Progress> {
+    let marker = line.find("[download]")?;
+    let rest = &line[marker + "[download]".len()..];
+
+    // e.g. "  45.2% of  10.34MiB at  5.60MiB/s ETA 00:02"
+    let pct_pos = rest.find('%')?;
+    let before = &rest[..pct_pos];
+    let num_start = before
+        .rfind(|c: char| c.is_ascii_digit() || c == '.')
+        .map(|i| {
+            let mut start = i;
+            while start > 0
+                && (before.as_bytes()[start - 1].is_ascii_digit()
+                    || before.as_bytes()[start - 1] == b'.')
+            {
+                start -= 1;
+            }
+            start
+        })?;
+    let pct: f64 = rest[num_start..].split('%').next()?.parse().ok()?;
+
+    let speed = rest
+        .split(" at ")
+        .nth(1)
+        .map(|s| s.split_whitespace().next().map(|s| s.to_string()))
+        .flatten();
+    let eta = rest.split("ETA ").nth(1).map(|e| e.trim().to_string());
+
+    Some(Progress {
+        pct,
+        speed: speed.filter(|s| s.ends_with("/s")),
+        eta: eta.filter(|e| e.contains(':')),
+    })
+}
+
+/// Peel `ERROR: …` down to the human-readable message (bot-check text etc).
+pub fn parse_error_line(line: &str) -> Option<String> {
+    let mut msg = line.strip_prefix("ERROR: ")?.trim().to_string();
+    if msg.starts_with('[') {
+        if let (Some(close), Some(open)) = (msg.find(']'), msg.find('[')) {
+            if close > open {
+                msg = msg[close + 1..].trim_start().to_string();
+            }
+        }
+    }
+    // Leftover per-video segment, e.g. "xyz: Sign in to confirm ..."
+    if let Some(colon) = msg.find(": ") {
+        let tail = msg[colon + 2..].to_string();
+        if tail.contains(':') {
+            // looks like a URL/time, not an identifier prefix — keep msg
+        } else if !msg[..colon].contains(' ') {
+            msg = tail;
+        }
+    }
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
+/// Build the full argv for one download, per PLAN.md locked flags.
+pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<String> {
+    let mut args = vec![
+        "--newline".to_string(),
+        "--impersonate".to_string(),
+        "chrome".to_string(),
+    ];
+    if let Some(file) = &config.cookie_file {
+        args.extend(["--cookies".to_string(), file.clone()]);
+    } else {
+        args.extend(["--cookies-from-browser".to_string(), "chrome".to_string()]);
+    }
+    if let Some(dir) = &config.save_path {
+        args.extend(["-P".to_string(), dir.clone()]);
+    }
+    match mode {
+        DownloadMode::Audio => args.extend([
+            "-x".to_string(),
+            "--audio-format".to_string(),
+            "mp3".to_string(),
+        ]),
+        DownloadMode::Video => args.extend(["-S".to_string(), "res:1080".to_string()]),
+    }
+    args.push(url.to_string());
+    args
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_percent_speed_and_eta() {
+        let p =
+            parse_progress_line("[download]  45.2% of  10.34MiB at  5.60MiB/s ETA 00:02").unwrap();
+        assert_eq!(p.pct, 45.2);
+        assert_eq!(p.speed.as_deref(), Some("5.60MiB/s"));
+        assert_eq!(p.eta.as_deref(), Some("00:02"));
+    }
+
+    #[test]
+    fn parses_final_line_without_speed_or_eta() {
+        let p = parse_progress_line("[download] 100% of   10.34MiB in 00:03").unwrap();
+        assert_eq!(p.pct, 100.0);
+        assert!(p.speed.is_none());
+        assert!(p.eta.is_none());
+    }
+
+    #[test]
+    fn ignores_unrelated_lines() {
+        assert!(parse_progress_line("[download] Destination: out.mp4").is_none());
+        assert!(parse_progress_line("ERROR: something broke").is_none());
+        assert!(parse_progress_line("").is_none());
+    }
+
+    #[test]
+    fn extracts_error_message() {
+        let msg = parse_error_line("ERROR: [youtube] xyz: Sign in to confirm you're not a bot");
+        assert_eq!(msg, Some("Sign in to confirm you're not a bot".to_string()));
+        assert!(parse_error_line("[download] normal line").is_none());
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    fn fixture_script(body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir();
+        let script = dir.join(format!(
+            "ytui_engine_fixture_{}_{}",
+            body.len(),
+            std::process::id()
+        ));
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    #[test]
+    fn collects_lines_and_success() {
+        let script = fixture_script(
+            "printf '[download]  1.0%% of 1MB\\n[download] 100%% of 1MB\\n'; echo err >&2",
+        );
+        let mut lines = Vec::new();
+        let result = run_engine(&mut Command::new(&script), &mut |line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "[download]  1.0% of 1MB");
+        assert!(result.ok);
+        assert!(result.stderr_tail.contains("err"));
+    }
+
+    #[test]
+    fn failure_status_and_stderr_captured() {
+        let script = fixture_script("printf 'partial'; echo 'ERROR: bot' >&2; exit 1");
+        let mut got = Vec::new();
+        let result = run_engine(&mut Command::new(&script), &mut |line| {
+            got.push(line.to_string())
+        })
+        .unwrap();
+        assert!(!result.ok);
+        assert_eq!(got, vec!["partial".to_string()]);
+        assert!(result.stderr_tail.contains("ERROR: bot"));
+    }
+
+    #[test]
+    fn spawn_failure_is_reported() {
+        let result = run_engine(&mut Command::new("/nonexistent/yt-dlp"), &mut |_| {});
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn config(save: Option<&str>, cookie: Option<&str>) -> EngineConfig {
+        EngineConfig {
+            engine_path: PathBuf::from("/fake/engine"),
+            save_path: save.map(|s| s.to_string()),
+            cookie_file: cookie.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn video_download_flags() {
+        let args = build_args(
+            &config(None, None),
+            "https://youtu.be/x",
+            DownloadMode::Video,
+        );
+        assert!(args.contains(&"--newline".to_string()));
+        assert!(args.contains(&"--impersonate".to_string()));
+        assert!(args.contains(&"chrome".to_string()));
+        assert!(args.contains(&"-S".to_string()));
+        assert!(args.contains(&"res:1080".to_string()));
+        assert!(args.last().unwrap().starts_with("https://youtu.be"));
+        assert!(!args.contains(&"-x".to_string()));
+    }
+
+    #[test]
+    fn mp3_extraction_flags() {
+        let args = build_args(
+            &config(None, None),
+            "https://youtu.be/x",
+            DownloadMode::Audio,
+        );
+        assert!(args.contains(&"-x".to_string()));
+        assert!(args.contains(&"--audio-format".to_string()));
+        let i = args.iter().position(|a| a == "--audio-format").unwrap();
+        assert_eq!(args[i + 1], "mp3");
+    }
+
+    #[test]
+    fn cookies_default_to_chrome_browser_store() {
+        let args = build_args(&config(None, None), "u", DownloadMode::Video);
+        let i = args
+            .iter()
+            .position(|a| a == "--cookies-from-browser")
+            .unwrap();
+        assert_eq!(args[i + 1], "chrome");
+    }
+
+    #[test]
+    fn cookie_file_overrides_browser_store() {
+        let args = build_args(
+            &config(None, Some("/c/cookies.txt")),
+            "u",
+            DownloadMode::Video,
+        );
+        let i = args.iter().position(|a| a == "--cookies").unwrap();
+        assert_eq!(args[i + 1], "/c/cookies.txt");
+        assert!(!args.contains(&"--cookies-from-browser".to_string()));
+    }
+
+    #[test]
+    fn save_path_sets_output_dir() {
+        let args = build_args(
+            &config(Some("/media/music"), None),
+            "u",
+            DownloadMode::Audio,
+        );
+        let i = args.iter().position(|a| a == "-P").unwrap();
+        assert_eq!(args[i + 1], "/media/music");
+    }
+}

@@ -1,13 +1,40 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use downloader::{
+    build_args, parse_error_line, parse_progress_line, run_engine, DownloadMode, EngineConfig,
+};
+use serde::Serialize;
 use settings::{Settings, SettingsStore};
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
+mod downloader;
 mod settings;
 
 struct AppState {
     store: Mutex<SettingsStore>,
+    running: Arc<AtomicBool>,
 }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+enum DownloadEvent {
+    Started {
+        url: String,
+    },
+    Progress {
+        pct: f64,
+        speed: Option<String>,
+        eta: Option<String>,
+    },
+    Finished {
+        ok: bool,
+        message: String,
+        stderr_tail: String,
+    },
+}
+
+const EVENT: &str = "download-event";
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Settings {
@@ -20,10 +47,92 @@ fn set_settings(state: State<AppState>, settings: Settings) {
 }
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn start_download(
+    app: AppHandle,
+    state: State<AppState>,
+    url: String,
+    mode: String,
+) -> Result<(), String> {
+    if state.running.swap(true, Ordering::SeqCst) {
+        return Err("A download is already running".into());
+    }
+
+    let dmode = match mode.as_str() {
+        "audio" => DownloadMode::Audio,
+        "video" => DownloadMode::Video,
+        _ => {
+            state.running.store(false, Ordering::SeqCst);
+            return Err(format!("unknown mode: {mode}"));
+        }
+    };
+    let settings = state.store.lock().unwrap().load();
+    let config = EngineConfig {
+        engine_path: "yt-dlp".into(), // packaged sidecar resolution lands in milestone 5
+        save_path: settings.save_path,
+        cookie_file: settings.cookie_file,
+    };
+    let args = build_args(&config, &url, dmode);
+
+    let app = app.clone();
+    let running = state.running.clone();
+    std::thread::spawn(move || {
+        let _ = app.emit(EVENT, DownloadEvent::Started { url: url.clone() });
+        let mut last_error: Option<String> = None;
+
+        let mut cmd = std::process::Command::new("yt-dlp");
+        cmd.args(&args);
+        let result = run_engine(&mut cmd, &mut |line| {
+            if let Some(p) = parse_progress_line(line) {
+                let _ = app.emit(
+                    EVENT,
+                    DownloadEvent::Progress {
+                        pct: p.pct,
+                        speed: p.speed,
+                        eta: p.eta,
+                    },
+                );
+            }
+            if let Some(err) = parse_error_line(line) {
+                last_error = Some(err);
+            }
+        });
+
+        let handle = match result {
+            Ok(r) => r,
+            // spawn error: likely no engine on PATH yet (packaged in milestone 5)
+            Err(e) => {
+                running.store(false, Ordering::SeqCst);
+                let _ = app.emit(
+                    EVENT,
+                    DownloadEvent::Finished {
+                        ok: false,
+                        message: format!("could not start engine: {e}"),
+                        stderr_tail: String::new(),
+                    },
+                );
+                return;
+            }
+        };
+
+        let _ = app.emit(
+            EVENT,
+            DownloadEvent::Finished {
+                ok: handle.ok,
+                message: if handle.ok {
+                    String::new()
+                } else {
+                    last_error.unwrap_or_else(|| "download failed".to_string())
+                },
+                stderr_tail: handle.stderr_tail,
+            },
+        );
+        running.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -35,10 +144,15 @@ pub fn run() {
             let store = SettingsStore::new(&config_dir.join("settings.json"));
             app.manage(AppState {
                 store: Mutex::new(store),
+                running: Arc::new(AtomicBool::new(false)),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, get_settings, set_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            set_settings,
+            start_download
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
