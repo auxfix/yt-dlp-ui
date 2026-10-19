@@ -26,3 +26,6 @@ dist-ssr
 .superpowers/
 
 yt-dlp-ui/
+
+# bundled engine binaries — restore with scripts/fetch-engine.sh
+src-tauri/engine/
