@@ -19,6 +19,23 @@ function SettingsPanel({
   onSave: (s: Settings) => void;
 }) {
   const [draft, setDraft] = useState<Settings>(settings);
+  const [engine, setEngine] = useState<{
+    version: string | null;
+    origin: string;
+  } | null>(null);
+
+  useEffect(() => {
+    invoke<{ version: string | null; origin: string }>("engine_version")
+      .then(setEngine)
+      .catch(() => setEngine(null));
+  }, []);
+
+  const updateEngine = async () => {
+    await invoke("update_engine");
+    invoke<{ version: string | null; origin: string }>("engine_version")
+      .then(setEngine)
+      .catch(() => setEngine(null));
+  };
 
   const browseSavePath = async () => {
     const picked = await open({ directory: true, multiple: false });
@@ -60,6 +77,13 @@ function SettingsPanel({
       <button aria-label="Browse cookies" onClick={browseCookies}>
         Browse…
       </button>
+      <section data-testid="engine-info">
+        <span>
+          Engine:{" "}
+          {engine?.version ?? "unknown"} ({engine?.origin ?? "?"})
+        </span>
+        <button onClick={updateEngine}>Update engine</button>
+      </section>
       <button onClick={() => onSave(draft)}>Save</button>
       <button onClick={() => setDraft(settings)}>Cancel</button>
     </section>

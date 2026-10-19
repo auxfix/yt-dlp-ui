@@ -121,4 +121,55 @@ describe("yt-ui shell", () => {
       "/home/me/cookies.txt"
     );
   });
+
+  it("engine row shows version and origin from engine_version", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_history") return Promise.resolve([]);
+      if (cmd === "engine_version")
+        return Promise.resolve({
+          version: "2026.10.10.233141",
+          origin: "user",
+        });
+      return Promise.resolve({ save_path: null, cookie_file: null });
+    });
+    await renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(
+      await screen.findByTestId("engine-info")
+    ).toHaveTextContent("2026.10.10.233141");
+    expect(screen.getByTestId("engine-info")).toHaveTextContent("user");
+  });
+
+  it("Update engine button calls update_engine and shows result", async () => {
+    let calls = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
+      if (cmd === "engine_version")
+        return Promise.resolve({
+          version: calls === 0 ? "2026.10.10.233141" : "2026.10.20.233405",
+          origin: "user",
+        });
+      if (cmd === "get_history") return Promise.resolve([]);
+      return Promise.resolve({ save_path: null, cookie_file: null });
+    });
+    await renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByTestId("engine-info");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
+      if (cmd === "engine_version")
+        return Promise.resolve({
+          version: "2026.10.20.233405",
+          origin: "user",
+        });
+      if (cmd === "get_history") return Promise.resolve([]);
+      return Promise.resolve({ save_path: null, cookie_file: null });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /update engine/i }));
+    await waitFor(async () => {
+      expect(
+        (await screen.findByTestId("engine-info")).textContent
+      ).toContain("2026.10.20.233405");
+    });
+  });
 });
