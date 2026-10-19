@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 const invokeMock = vi.fn();
@@ -31,7 +31,10 @@ async function renderApp() {
 describe("yt-ui shell", () => {
   beforeEach(() => {
     invokeMock.mockReset();
-    invokeMock.mockResolvedValue({ save_path: null, cookie_file: null });
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_history") return Promise.resolve([]);
+      return Promise.resolve({ save_path: null, cookie_file: null });
+    });
   });
 
   it("shows Download and History tabs and starts on Download", async () => {
@@ -41,10 +44,11 @@ describe("yt-ui shell", () => {
     expect(screen.getByLabelText(/url/i)).toBeInTheDocument();
   });
 
-  it("switches to History tab", async () => {
+  it("switches to History tab and shows the history list shell", async () => {
     await renderApp();
     fireEvent.click(screen.getByRole("tab", { name: "History" }));
-    expect(screen.getByRole("tabpanel")).toHaveTextContent("History tab");
+    await act(async () => {}); // flush async get_history state update
+    expect(await screen.findByText(/No downloads yet/)).toBeInTheDocument();
   });
 
   it("gear opens settings panel and shows save path input", async () => {
