@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    ytscaffold_lib::run()
+    yt_ui_lib::run()
 }
