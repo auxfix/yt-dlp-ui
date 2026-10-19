@@ -34,18 +34,24 @@ pub fn run_engine(
 
     let stderr_handle = std::thread::spawn(move || {
         let mut tail = String::new();
+        let mut lines = Vec::new();
         for line in BufReader::new(stderr).lines() {
             if let Ok(line) = line {
                 tail.push_str(&line);
                 tail.push('\n');
                 let excess = tail.len().saturating_sub(STDERR_TAIL_LIMIT);
                 if excess > 0 {
-                    // keep the most recent bytes
+                    // trim on a char boundary; a byte cut mid-glyph panics
+                    let mut excess = excess;
+                    while excess < tail.len() && !tail.is_char_boundary(excess) {
+                        excess += 1;
+                    }
                     tail = tail[excess..].to_string();
                 }
+                lines.push(line);
             }
         }
-        tail
+        (tail, lines)
     });
 
     for line in BufReader::new(stdout).lines() {
@@ -54,16 +60,24 @@ pub fn run_engine(
         }
     }
     let status = child.wait()?;
+    let (stderr_tail, stderr_lines) = stderr_handle.join().unwrap_or_default();
+    // yt-dlp writes ERROR: text on stderr; the caller's parser sees both streams
+    for line in &stderr_lines {
+        on_line(line);
+    }
 
     Ok(EngineResult {
         ok: status.success(),
-        stderr_tail: stderr_handle.join().unwrap_or_default(),
+        stderr_tail,
     })
 }
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub engine_path: PathBuf,
+    /// Directory holding the engine's siblings (ffmpeg, ffprobe, deno) when it
+    /// came bundled; None when using fallback PATH engines.
+    pub engine_dir: Option<String>,
     pub save_path: Option<String>,
     pub cookie_file: Option<String>,
 }
@@ -155,7 +169,7 @@ pub fn parse_error_line(line: &str) -> Option<String> {
 /// what `--print after_move:filepath` emits — the final file on disk.
 pub fn parse_final_file(line: &str) -> Option<String> {
     let t = line.trim();
-    if t.is_empty() || t.starts_with('[') {
+    if t.is_empty() || t.starts_with('[') || t.starts_with("ERROR:") {
         return None;
     }
     Some(t.to_string())
@@ -165,11 +179,17 @@ pub fn parse_final_file(line: &str) -> Option<String> {
 pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<String> {
     let mut args = vec![
         "--newline".to_string(),
+        "--progress".to_string(),
         "--impersonate".to_string(),
         "chrome".to_string(),
         "--print".to_string(),
         "after_move:filepath".to_string(),
     ];
+    if let Some(dir) = &config.engine_dir {
+        // bundled ffmpeg/ffprobe/deno live next to the engine; Tauri resource
+        // dirs are not on the PATH yt-dlp would search
+        args.extend(["--ffmpeg-location".to_string(), dir.clone()]);
+    }
     if let Some(file) = &config.cookie_file {
         args.extend(["--cookies".to_string(), file.clone()]);
     } else {
@@ -186,6 +206,7 @@ pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<S
         ]),
         DownloadMode::Video => args.extend(["-S".to_string(), "res:1080".to_string()]),
     }
+    args.push("--".to_string());
     args.push(url.to_string());
     args
 }
@@ -197,6 +218,7 @@ mod final_file_tests {
     fn config() -> EngineConfig {
         EngineConfig {
             engine_path: PathBuf::from("/fake/engine"),
+            engine_dir: None,
             save_path: None,
             cookie_file: None,
         }
@@ -222,6 +244,7 @@ mod final_file_tests {
         assert_eq!(parse_final_file("[download] Destination: /a/b.mp4"), None);
         assert_eq!(parse_final_file(""), None);
         assert_eq!(parse_final_file("[youtube] abc: fetching"), None);
+        assert_eq!(parse_final_file("ERROR: Sign in to confirm"), None);
     }
 }
 
@@ -267,9 +290,11 @@ mod runner_tests {
 
     fn fixture_script(body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir();
         let script = dir.join(format!(
-            "ytui_engine_fixture_{}_{}",
+            "ytui_engine_fixture_{}_{}_{}",
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             body.len(),
             std::process::id()
         ));
@@ -290,8 +315,9 @@ mod runner_tests {
             lines.push(line.to_string())
         })
         .unwrap();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3); // 2 stdout + stderr fed to callback too
         assert_eq!(lines[0], "[download]  1.0% of 1MB");
+        assert!(lines.iter().any(|l| l == "err"));
         assert!(result.ok);
         assert!(result.stderr_tail.contains("err"));
     }
@@ -305,7 +331,8 @@ mod runner_tests {
         })
         .unwrap();
         assert!(!result.ok);
-        assert_eq!(got, vec!["partial".to_string()]);
+        assert!(got.contains(&"partial".to_string()));
+        assert!(got.iter().any(|l| l.contains("ERROR: bot")));
         assert!(result.stderr_tail.contains("ERROR: bot"));
     }
 
@@ -313,6 +340,32 @@ mod runner_tests {
     fn spawn_failure_is_reported() {
         let result = run_engine(&mut Command::new("/nonexistent/yt-dlp"), &mut |_| {});
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stderr_lines_reach_the_line_callback() {
+        // yt-dlp puts ERROR: text on stderr; the parser must see it
+        let script = fixture_script("echo 'ERROR: Sign in to confirm' >&2");
+        let mut lines = Vec::new();
+        let result = run_engine(&mut Command::new(&script), &mut |line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        assert!(result.ok);
+        assert!(
+            lines.iter().any(|l| l.contains("Sign in to confirm")),
+            "stderr lines must reach the callback, got {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn multibyte_stderr_tail_does_not_panic() {
+        // Cyrillic (2-byte chars) crossing the tail limit must not slice a
+        // UTF-8 boundary when trimming
+        let script = fixture_script("\ni=0; while [ $i -lt 4000 ]; do printf '\u{e6fc}\u{0935}'; i=$((i+1)); done >&2; echo done >&2; echo handled >&2");
+        let result = run_engine(&mut Command::new(&script), &mut |_| {});
+        assert!(result.is_ok() && result.unwrap().ok);
     }
 }
 
@@ -358,6 +411,7 @@ mod args_tests {
     fn config(save: Option<&str>, cookie: Option<&str>) -> EngineConfig {
         EngineConfig {
             engine_path: PathBuf::from("/fake/engine"),
+            engine_dir: None,
             save_path: save.map(|s| s.to_string()),
             cookie_file: cookie.map(|s| s.to_string()),
         }
@@ -371,12 +425,41 @@ mod args_tests {
             DownloadMode::Video,
         );
         assert!(args.contains(&"--newline".to_string()));
+        assert!(args.contains(&"--progress".to_string()));
         assert!(args.contains(&"--impersonate".to_string()));
         assert!(args.contains(&"chrome".to_string()));
         assert!(args.contains(&"-S".to_string()));
         assert!(args.contains(&"res:1080".to_string()));
+        // URL terminated with `--` so dash-leading input can't be options
+        let url_pos = args.iter().position(|a| a.starts_with("https://")).unwrap();
+        assert_eq!(args[url_pos - 1], "--");
         assert!(args.last().unwrap().starts_with("https://youtu.be"));
         assert!(!args.contains(&"-x".to_string()));
+    }
+
+    #[test]
+    fn engine_dir_wires_ffmpeg_location() {
+        let cfg = EngineConfig {
+            engine_path: PathBuf::from("/bundle/engine/yt-dlp"),
+            engine_dir: Some("/bundle/engine".into()),
+            save_path: None,
+            cookie_file: None,
+        };
+        let args = build_args(&cfg, "u", DownloadMode::Video);
+        let i = args.iter().position(|a| a == "--ffmpeg-location").unwrap();
+        assert_eq!(args[i + 1], "/bundle/engine");
+    }
+
+    #[test]
+    fn engine_dir_absent_omits_ffmpeg_location() {
+        let cfg = EngineConfig {
+            engine_path: PathBuf::from("yt-dlp"),
+            engine_dir: None,
+            save_path: None,
+            cookie_file: None,
+        };
+        let args = build_args(&cfg, "u", DownloadMode::Video);
+        assert!(!args.contains(&"--ffmpeg-location".to_string()));
     }
 
     #[test]

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub save_path: Option<String>,
     pub cookie_file: Option<String>,
+    /// Manual engine-binary override; empty string means "auto chain".
+    #[serde(default)]
+    pub engine_path: Option<String>,
 }
 
 pub struct SettingsStore {
@@ -94,5 +97,17 @@ mod tests {
         let s = store.load();
         assert_eq!(s.save_path.as_deref(), Some("/x"));
         assert_eq!(s.cookie_file, None);
+    }
+
+    #[test]
+    fn engine_path_override_persists() {
+        let path = temp_dir("engine_override");
+        let store = SettingsStore::new(&path);
+        let mut s = store.load();
+        assert_eq!(s.engine_path, None);
+        s.engine_path = Some("/opt/newest/yt-dlp".into());
+        store.save(&s);
+        let reloaded = SettingsStore::new(&path).load();
+        assert_eq!(reloaded.engine_path.as_deref(), Some("/opt/newest/yt-dlp"));
     }
 }

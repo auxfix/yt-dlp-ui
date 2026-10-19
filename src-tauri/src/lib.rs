@@ -100,7 +100,7 @@ fn engine_version(app: AppHandle) -> EngineInfo {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_engine(app: AppHandle) -> Result<String, String> {
     let os = if cfg!(windows) { "windows" } else { "linux" };
     let json = reqwest::blocking::Client::builder()
@@ -142,11 +142,14 @@ fn history_entry(
     HistoryEntry {
         url: url.to_string(),
         title: file_title(file_path.as_deref()).unwrap_or_else(|| {
-            if ok || message.is_empty() {
+            // long robot-wall text pollutes the history list; truncate
+            const TRUNC: usize = 80;
+            let fallback = if ok || message.is_empty() {
                 url.to_string()
             } else {
-                format!("{message}")
-            }
+                message.chars().take(TRUNC).collect::<String>()
+            };
+            fallback
         }),
         mode: mode.to_string(),
         ok,
@@ -202,13 +205,24 @@ fn start_download(
         }
     };
     let settings = state.store.lock().unwrap().load();
-    let engine_path = match current_engine(&app) {
-        engine::EngineOrigin::User(p) => p,
-        engine::EngineOrigin::Bundled(p) => p,
-        engine::EngineOrigin::Path(s) => std::path::PathBuf::from(s),
-    };
+    let engine_override = settings
+        .engine_path
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    let engine_path = engine_override.or_else(|| match current_engine(&app) {
+        engine::EngineOrigin::User(p) => Some(p),
+        engine::EngineOrigin::Bundled(p) => Some(p),
+        engine::EngineOrigin::Path(_) => None,
+    });
+    let engine_dir = engine_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().to_string());
+    let engine_path = engine_path.unwrap_or_else(|| std::path::PathBuf::from("yt-dlp"));
     let config = EngineConfig {
         engine_path,
+        engine_dir,
         save_path: settings.save_path,
         cookie_file: settings.cookie_file,
     };
@@ -260,7 +274,7 @@ fn start_download(
                     DownloadEvent::Finished {
                         ok: false,
                         message: format!("could not start engine: {e}"),
-                        stderr_tail: String::new(),
+                        stderr_tail: format!("could not start engine: {e}"),
                         cookie_issue: false,
                     },
                 );
