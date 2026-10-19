@@ -11,8 +11,10 @@ use settings::{Settings, SettingsStore};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 mod downloader;
+mod engine;
 mod history;
 mod settings;
+mod updater;
 
 struct AppState {
     store: Mutex<SettingsStore>,
@@ -40,6 +42,87 @@ enum DownloadEvent {
 }
 
 const EVENT: &str = "download-event";
+
+fn engine_file_name() -> &'static str {
+    if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    }
+}
+
+fn current_engine(app: &AppHandle) -> engine::EngineOrigin {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    engine::resolve_engine(engine::EngineSources {
+        user_engine: Some(data_dir.join(engine_file_name())),
+        bundled_engine: app
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|r| r.join("engine").join(engine_file_name())),
+        fallback: "yt-dlp".to_string(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineInfo {
+    version: Option<String>,
+    origin: String,
+}
+
+#[tauri::command]
+fn engine_version(app: AppHandle) -> EngineInfo {
+    use std::process::Stdio;
+    let engine = current_engine(&app);
+    let mut invocation = match &engine {
+        engine::EngineOrigin::User(p) => std::process::Command::new(p),
+        engine::EngineOrigin::Bundled(p) => std::process::Command::new(p),
+        engine::EngineOrigin::Path(s) => std::process::Command::new(s),
+    };
+    invocation.arg("--version").stdout(Stdio::piped());
+    let version = invocation
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|v| !v.is_empty());
+    let origin = match engine {
+        engine::EngineOrigin::User(_) => "user",
+        engine::EngineOrigin::Bundled(_) => "bundled",
+        engine::EngineOrigin::Path(_) => "path",
+    };
+    EngineInfo {
+        version,
+        origin: origin.to_string(),
+    }
+}
+
+#[tauri::command]
+fn update_engine(app: AppHandle) -> Result<String, String> {
+    let os = if cfg!(windows) { "windows" } else { "linux" };
+    let json = reqwest::blocking::Client::builder()
+        .user_agent("yt-ui")
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(updater::latest_url())
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .map_err(|e| e.to_string())?;
+    let pick = updater::pick_asset(&json, os).ok_or("no asset for this OS")?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dest = data_dir.join(engine_file_name());
+    updater::download_to_file(&pick.url, &dest)?;
+    Ok(pick.tag)
+}
 
 fn file_title(file: Option<&str>) -> Option<String> {
     file.and_then(|f| {
@@ -119,8 +202,13 @@ fn start_download(
         }
     };
     let settings = state.store.lock().unwrap().load();
+    let engine_path = match current_engine(&app) {
+        engine::EngineOrigin::User(p) => p,
+        engine::EngineOrigin::Bundled(p) => p,
+        engine::EngineOrigin::Path(s) => std::path::PathBuf::from(s),
+    };
     let config = EngineConfig {
-        engine_path: "yt-dlp".into(), // packaged sidecar resolution lands in milestone 5
+        engine_path,
         save_path: settings.save_path,
         cookie_file: settings.cookie_file,
     };
@@ -134,7 +222,7 @@ fn start_download(
         let mut last_error: Option<String> = None;
         let mut final_file: Option<String> = None;
 
-        let mut cmd = std::process::Command::new("yt-dlp");
+        let mut cmd = std::process::Command::new(&config.engine_path);
         cmd.args(&args);
         let result = run_engine(&mut cmd, &mut |line| {
             if let Some(p) = parse_progress_line(line) {
@@ -228,7 +316,9 @@ pub fn run() {
             set_settings,
             set_cookie_file,
             get_history,
-            start_download
+            start_download,
+            engine_version,
+            update_engine
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
