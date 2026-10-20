@@ -130,8 +130,7 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
     let speed = rest
         .split(" at ")
         .nth(1)
-        .map(|s| s.split_whitespace().next().map(|s| s.to_string()))
-        .flatten();
+        .and_then(|s| s.split_whitespace().next().map(|s| s.to_string()));
     let eta = rest.split("ETA ").nth(1).map(|e| e.trim().to_string());
 
     Some(Progress {
@@ -165,12 +164,11 @@ pub fn should_retry_without_cookies(used_chrome: bool, ok: bool, stderr_tail: &s
 /// Peel `ERROR: …` down to the human-readable message (bot-check text etc).
 pub fn parse_error_line(line: &str) -> Option<String> {
     let mut msg = line.strip_prefix("ERROR: ")?.trim().to_string();
-    if msg.starts_with('[') {
-        if let (Some(close), Some(open)) = (msg.find(']'), msg.find('[')) {
-            if close > open {
-                msg = msg[close + 1..].trim_start().to_string();
-            }
-        }
+    if msg.starts_with('[')
+        && let (Some(close), Some(open)) = (msg.find(']'), msg.find('['))
+        && close > open
+    {
+        msg = msg[close + 1..].trim_start().to_string();
     }
     // Leftover per-video segment, e.g. "xyz: Sign in to confirm ..."
     if let Some(colon) = msg.find(": ") {

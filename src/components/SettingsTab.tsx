@@ -2,9 +2,12 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
+type CookieMode = "chrome" | "none" | "file";
+
 interface Settings {
   save_path: string | null;
   cookie_file: string | null;
+  cookie_mode: CookieMode | null;
   engine_path: string | null;
 }
 
@@ -16,8 +19,18 @@ interface EngineInfo {
 const DEFAULTS: Settings = {
   save_path: null,
   cookie_file: null,
+  cookie_mode: "chrome",
   engine_path: null,
 };
+
+function normalize(s: Partial<Settings>): Settings {
+  return {
+    ...DEFAULTS,
+    ...s,
+    // a stored cookie file means file mode, even on legacy settings files
+    cookie_mode: s.cookie_mode ?? (s.cookie_file ? "file" : "chrome"),
+  };
+}
 
 export default function SettingsTab({ active }: { active: boolean }) {
   const [draft, setDraft] = useState<Settings>(DEFAULTS);
@@ -29,18 +42,18 @@ export default function SettingsTab({ active }: { active: boolean }) {
     if (!active) {
       return;
     }
-    invoke<Settings>("get_settings")
-      .then((s) => setDraft({ ...DEFAULTS, ...s }))
+    invoke<Partial<Settings>>("get_settings")
+      .then((s) => setDraft(normalize(s)))
       .catch(() => setDraft(DEFAULTS));
     invoke<EngineInfo>("engine_version")
       .then(setEngine)
       .catch(() => setEngine(null));
   }, [active]);
 
-  const browseFolder = async (which: "save_path") => {
+  const browseFolder = async () => {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked === "string") {
-      setDraft((d) => ({ ...d, [which]: picked }));
+      setDraft((d) => ({ ...d, save_path: picked }));
     }
   };
 
@@ -53,8 +66,17 @@ export default function SettingsTab({ active }: { active: boolean }) {
       // persist immediately; banner flow depends on it landing even if the
       // settings draft is never saved
       await invoke("set_cookie_file", { path: picked });
-      setDraft((d) => ({ ...d, cookie_file: picked }));
+      setDraft((d) => ({ ...d, cookie_file: picked, cookie_mode: "file" }));
     }
+  };
+
+  const changeCookieMode = (mode: CookieMode) => {
+    setDraft((d) => ({
+      ...d,
+      cookie_mode: mode,
+      // file wins over mode on the backend; clear it so the choice is honest
+      cookie_file: mode === "file" ? d.cookie_file : null,
+    }));
   };
 
   const browseEngine = async () => {
@@ -87,25 +109,44 @@ export default function SettingsTab({ active }: { active: boolean }) {
               setDraft((d) => ({ ...d, save_path: e.target.value }))
             }
           />
-          <button
-            aria-label="Browse save path"
-            onClick={() => browseFolder("save_path")}
-          >
+          <button aria-label="Browse save path" onClick={browseFolder}>
             Browse…
           </button>
         </label>
+      </div>
+
+      <div className="card">
+        <h2>Cookies</h2>
         <label>
-          <span>Cookies file</span>
-          <input
-            value={draft.cookie_file ?? ""}
-            onChange={(e) =>
-              setDraft((d) => ({ ...d, cookie_file: e.target.value }))
-            }
-          />
-          <button aria-label="Browse cookies" onClick={browseCookies}>
-            Browse…
-          </button>
+          <span>Cookie source</span>
+          <select
+            aria-label="Cookie source"
+            value={draft.cookie_mode ?? "chrome"}
+            onChange={(e) => changeCookieMode(e.target.value as CookieMode)}
+          >
+            <option value="chrome">Chrome (recommended)</option>
+            <option value="none">None — download without cookies</option>
+            <option value="file">cookies.txt file</option>
+          </select>
         </label>
+        {draft.cookie_mode === "file" && (
+          <label>
+            <span>Cookies file</span>
+            <input
+              value={draft.cookie_file ?? ""}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, cookie_file: e.target.value }))
+              }
+            />
+            <button aria-label="Browse cookies" onClick={browseCookies}>
+              Browse…
+            </button>
+          </label>
+        )}
+        <p className="hint">
+          Chrome cookies help with bot checks. If Chrome's cookie store is
+          locked, downloads retry once without cookies.
+        </p>
       </div>
 
       <div className="card">
@@ -122,7 +163,10 @@ export default function SettingsTab({ active }: { active: boolean }) {
           <button aria-label="Browse engine" onClick={browseEngine}>
             Browse…
           </button>
-          <button aria-label="Clear engine" onClick={() => setDraft((d) => ({ ...d, engine_path: null }))}>
+          <button
+            aria-label="Clear engine"
+            onClick={() => setDraft((d) => ({ ...d, engine_path: null }))}
+          >
             Clear
           </button>
         </label>

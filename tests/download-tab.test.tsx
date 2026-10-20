@@ -83,8 +83,38 @@ describe("Download tab", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
-  it("shows live percent and disables button while running", () => {
+  it("switches to running immediately on click, before any event", () => {
     render(<DownloadTab />);
+    fireEvent.change(screen.getByLabelText(/url/i), {
+      target: { value: "https://youtu.be/x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download/i }));
+    expect(screen.getByTestId("run-status")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /download/i })).toBeDisabled();
+  });
+
+  it("streams engine log lines while running", () => {
+    render(<DownloadTab />);
+    fireEvent.change(screen.getByLabelText(/url/i), {
+      target: { value: "https://youtu.be/x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download/i }));
+    emit({ type: "started", url: "https://youtu.be/x" });
+    emit({ type: "log", line: "WARNING: Read timed out, retrying" });
+    expect(screen.getByTestId("engine-log")).toHaveTextContent(
+      "Read timed out"
+    );
+  });
+
+  it("blocked preflight disables Download", () => {
+    render(<DownloadTab blocked />);
+    fireEvent.change(screen.getByLabelText(/url/i), {
+      target: { value: "https://youtu.be/x" },
+    });
+    expect(screen.getByRole("button", { name: /download/i })).toBeDisabled();
+  });
+
+  it("shows live percent and disables button while running", () => {    render(<DownloadTab />);
     fireEvent.change(screen.getByLabelText(/url/i), {
       target: { value: "https://youtu.be/x" },
     });

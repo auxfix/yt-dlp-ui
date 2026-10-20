@@ -46,6 +46,8 @@ function makeBackend(initial: Record<string, unknown>) {
         return Promise.resolve(undefined);
       case "engine_version":
         return Promise.resolve({ version: "2026.10.10.233141", origin: "user" });
+      case "health_check":
+        return Promise.resolve({ ok: true, components: [] });
       case "update_engine":
         store.updatedTag = true;
         return Promise.resolve("2026.10.20.233405");
@@ -91,11 +93,81 @@ describe("yt-ui tabs shell", () => {
     await renderApp();
     fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
     expect(await screen.findByLabelText("Save path")).toBeInTheDocument();
-    expect(screen.getByLabelText("Cookies file")).toBeInTheDocument();
+    expect(screen.getByLabelText("Cookie source")).toBeInTheDocument();
     expect(screen.getByLabelText("Engine")).toBeInTheDocument();
     expect(screen.getByTestId("engine-info")).toHaveTextContent(
       "2026.10.10.233141"
     );
+  });
+
+  it("preflight complains about missing components and blocks Download", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "health_check") {
+        return Promise.resolve({
+          ok: false,
+          components: [
+            {
+              name: "ffmpeg",
+              ok: false,
+              detail: "missing or not executable: /bundle/engine/ffmpeg",
+            },
+            { name: "deno", ok: false, detail: "deno not found on PATH" },
+          ],
+        });
+      }
+      if (cmd === "get_history") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await renderApp();
+    const banner = await screen.findByTestId("preflight");
+    expect(banner).toHaveTextContent(/ffmpeg/i);
+    expect(banner).toHaveTextContent(/deno/i);
+    expect(screen.getByRole("button", { name: /download/i })).toBeDisabled();
+  });
+
+  it("preflight Recheck re-runs the health check and clears once healthy", async () => {
+    let healthy = false;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "health_check") {
+        return Promise.resolve(
+          healthy
+            ? { ok: true, components: [] }
+            : {
+                ok: false,
+                components: [
+                  { name: "yt-dlp", ok: false, detail: "missing" },
+                ],
+              }
+        );
+      }
+      if (cmd === "get_history") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await renderApp();
+    await screen.findByTestId("preflight");
+    healthy = true;
+    fireEvent.click(screen.getByRole("button", { name: /recheck/i }));
+    await waitFor(() => {
+      expect(screen.queryByTestId("preflight")).not.toBeInTheDocument();
+    });
+  });
+
+  it("cookie source none is persisted and clears the cookie file", async () => {
+    await renderApp();
+    fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    const select = await screen.findByLabelText("Cookie source");
+    fireEvent.change(select, { target: { value: "none" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          save_path: null,
+          cookie_file: null,
+          cookie_mode: "none",
+          engine_path: null,
+        },
+      });
+    });
   });
 
   it("settings are refetched when the tab opens, not stale from mount", async () => {
@@ -136,6 +208,7 @@ describe("yt-ui tabs shell", () => {
         settings: {
           save_path: "/home/me/Videos",
           cookie_file: null,
+          cookie_mode: "chrome",
           engine_path: null,
         },
       });
@@ -156,6 +229,7 @@ describe("yt-ui tabs shell", () => {
         settings: {
           save_path: null,
           cookie_file: null,
+          cookie_mode: "chrome",
           engine_path: "/opt/newengine/yt-dlp",
         },
       });
@@ -176,6 +250,7 @@ describe("yt-ui tabs shell", () => {
         settings: {
           save_path: null,
           cookie_file: null,
+          cookie_mode: "chrome",
           engine_path: null,
         },
       });
@@ -196,6 +271,7 @@ describe("yt-ui tabs shell", () => {
         settings: {
           save_path: "/home/me/picked_music",
           cookie_file: null,
+          cookie_mode: "chrome",
           engine_path: null,
         },
       });
@@ -206,6 +282,9 @@ describe("yt-ui tabs shell", () => {
     openMock.mockResolvedValue("/home/me/cookies.txt");
     await renderApp();
     fireEvent.click(screen.getByRole("tab", { name: /Settings/ }));
+    fireEvent.change(await screen.findByLabelText("Cookie source"), {
+      target: { value: "file" },
+    });
     fireEvent.click(await screen.findByRole("button", { name: /browse cookies/i }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("set_cookie_file", {
@@ -227,6 +306,8 @@ describe("yt-ui tabs shell", () => {
         return Promise.resolve({ version: "2026.10.20.233405", origin: "user" });
       if (cmd === "update_engine") return Promise.resolve("2026.10.20.233405");
       if (cmd === "get_history") return Promise.resolve([]);
+      if (cmd === "health_check")
+        return Promise.resolve({ ok: true, components: [] });
       return Promise.resolve({ ...store });
     });
     fireEvent.click(screen.getByRole("button", { name: /update engine/i }));

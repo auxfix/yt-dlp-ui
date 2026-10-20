@@ -230,12 +230,11 @@ fn history_entry(
         title: file_title(file_path.as_deref()).unwrap_or_else(|| {
             // long robot-wall text pollutes the history list; truncate
             const TRUNC: usize = 80;
-            let fallback = if ok || message.is_empty() {
+            if ok || message.is_empty() {
                 url.to_string()
             } else {
                 message.chars().take(TRUNC).collect::<String>()
-            };
-            fallback
+            }
         }),
         mode: mode.to_string(),
         ok,

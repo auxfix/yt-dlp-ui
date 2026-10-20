@@ -4,11 +4,13 @@ A small desktop GUI wrapper around [yt-dlp](https://github.com/yt-dlp/yt-dlp) fo
 
 Features (v1 scope, see `PLAN.md` for the locked decisions):
 
-- Paste a URL, pick **mp3** or **video**, hit Download — live %, speed and ETA.
+- Paste a URL, pick **mp3** or **video**, hit Download — live %, speed and ETA, plus a live engine log (warnings/retries show up immediately, not after the process ends).
+- Cookies are **optional**: Chrome cookies by default (best bot-check resilience), `None` or a `cookies.txt` file in Settings. If Chrome's store is locked, the download retries once without cookies before failing.
 - Bot-check resilience: reads Chrome cookies automatically, falls back to a `cookies.txt` file picker when that breaks (exported once, stored and reused).
 - Bundled engine (`yt-dlp` nightly + `ffmpeg` + `deno`) shipped in the installer; an **Update engine** button pulls the newest nightly into app-data and overrides the bundled one — no PATH skills required from you.
+- **Preflight check on launch**: missing engine/ffmpeg/ffprobe/deno are listed with fix hints, Download stays disabled, and Recheck re-runs the check — no mystery failures.
 - History of past downloads (successes ✅ and failures ✖ with the engine logs in the error details).
-- Download | History | Settings tabs; settings persist save path, cookies file and an optional engine-binary override.
+- Download | History | Settings tabs; settings persist save path, cookie source, cookies file and an optional engine-binary override.
 
 ## Getting set up
 
@@ -41,6 +43,10 @@ It pulls the yt-dlp nightly (stored as `src-tauri/engine/yt-dlp` / `yt-dlp.exe`)
 npm run tauri build                # full installer/bundles (AppImage on Linux)
 npm run tauri dev                  # dev mode (engine = bare `yt-dlp` on PATH)
 ```
+
+### Linux/Wayland note
+
+The app sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup unless you already set it. Without it, WebKitGTK on some Wayland/GPU stacks crashes with `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display`. If you want GPU compositing back, set the variable yourself (any value, e.g. `0`) before launching; we skip the override when it's present.
 
 ## Testing
 

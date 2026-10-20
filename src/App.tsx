@@ -1,9 +1,21 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import DownloadTab from "./components/DownloadTab";
 import HistoryTab from "./components/HistoryTab";
 import SettingsTab from "./components/SettingsTab";
 
 type Tab = "download" | "history" | "settings";
+
+interface ComponentHealth {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+interface HealthReport {
+  ok: boolean;
+  components: ComponentHealth[];
+}
 
 const TABS: Array<{ id: Tab; icon: string; label: string }> = [
   { id: "download", icon: "⬇", label: "Download" },
@@ -23,6 +35,20 @@ function initialTheme(): Theme {
 export default function App() {
   const [tab, setTab] = useState<Tab>("download");
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [health, setHealth] = useState<HealthReport | null>(null);
+
+  const checkHealth = useCallback(() => {
+    invoke<HealthReport>("health_check")
+      .then(setHealth)
+      .catch(() => setHealth(null)); // dev/no-backend: don't brick the UI
+  }, []);
+
+  useEffect(() => {
+    checkHealth();
+  }, [checkHealth]);
+
+  const blocked = health !== null && !health.ok;
+  const missing = health?.components.filter((c) => !c.ok) ?? [];
 
   // persist & apply the color scheme on the <html> element
   useEffect(() => {
@@ -67,10 +93,31 @@ export default function App() {
         ))}
       </nav>
 
+      {blocked && (
+        <section className="card preflight-card" role="alert" data-testid="preflight">
+          <h2>Missing components</h2>
+          <ul className="preflight-list">
+            {missing.map((c) => (
+              <li key={c.name}>
+                <strong>{c.name}</strong> — {c.detail}
+              </li>
+            ))}
+          </ul>
+          <p className="hint">
+            Downloads are disabled until this is fixed. Fetch the engine set with{" "}
+            <code>scripts/fetch-engine.sh</code>, point Settings → Engine at a
+            working binary, or use Update engine there.
+          </p>
+          <div className="settings-actions">
+            <button onClick={checkHealth}>Recheck</button>
+          </div>
+        </section>
+      )}
+
       {/* all tabs stay mounted so in-flight download state survives switching */}
       <main className="content">
         <section className="panel" hidden={tab !== "download"} role="tabpanel">
-          <DownloadTab />
+          <DownloadTab blocked={blocked} />
         </section>
         <section className="panel" hidden={tab !== "history"} role="tabpanel">
           <HistoryTab />

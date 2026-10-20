@@ -30,16 +30,23 @@ interface FinishedPayload {
   stderrTail: string;
   cookieIssue: boolean;
 }
+interface LogPayload {
+  type: "log";
+  line: string;
+}
 
-type Payload = StartPayload | ProgressPayload | FinishedPayload;
+type Payload = StartPayload | ProgressPayload | FinishedPayload | LogPayload;
 
-export default function DownloadTab() {
+const LOG_LIMIT = 60;
+
+export default function DownloadTab({ blocked = false }: { blocked?: boolean }) {
   const [url, setUrl] = useState("");
   const [mode, setMode] = useState<Mode>("audio");
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState<{ message: string; stderrTail: string } | null>(null);
   const [cookieBanner, setCookieBanner] = useState(false);
+  const [logLines, setLogLines] = useState<string[]>([]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -54,6 +61,9 @@ export default function DownloadTab() {
           break;
         case "progress":
           setProgress({ pct: p.pct, speed: p.speed, eta: p.eta });
+          break;
+        case "log":
+          setLogLines((lines) => [...lines, p.line].slice(-LOG_LIMIT));
           break;
         case "finished":
           setStatus(p.ok ? "done" : "error");
@@ -70,10 +80,17 @@ export default function DownloadTab() {
   }, []);
 
   const start = () => {
-    if (!url.trim() || status === "running") {
+    if (!url.trim() || status === "running" || blocked) {
       return;
     }
+    // optimistic: the engine can take a while to say anything at all
+    setStatus("running");
+    setProgress(null);
+    setError(null);
+    setLogLines([]);
+    setCookieBanner(false);
     invoke("start_download", { url: url.trim(), mode }).catch((e) => {
+      setStatus("error");
       setError({ message: String(e), stderrTail: String(e) });
     });
   };
@@ -124,7 +141,11 @@ export default function DownloadTab() {
           </button>
         </div>
 
-        <button className="primary download-btn" onClick={start} disabled={running || !url.trim()}>
+        <button
+          className="primary download-btn"
+          onClick={start}
+          disabled={running || !url.trim() || blocked}
+        >
           {running ? (
             <>
               <span className="spin" aria-hidden>⭯</span> Downloading…
@@ -135,6 +156,9 @@ export default function DownloadTab() {
             </>
           )}
         </button>
+        {blocked && (
+          <p className="hint">Fix the missing components above to enable downloading.</p>
+        )}
       </div>
 
       {running && (
@@ -150,6 +174,9 @@ export default function DownloadTab() {
             {progress?.speed && <span className="meta-chip">{progress.speed}</span>}
             {progress?.eta && <span className="meta-chip">ETA {progress.eta}</span>}
           </div>
+          {pct === null && (
+            <p className="hint">Talking to YouTube — bot-check retries can take a minute.</p>
+          )}
         </div>
       )}
 
@@ -179,6 +206,13 @@ export default function DownloadTab() {
             <pre>{error.stderrTail}</pre>
           </details>
         </div>
+      )}
+
+      {logLines.length > 0 && (
+        <details className="card log-card" open>
+          <summary>Engine log</summary>
+          <pre data-testid="engine-log">{logLines.join("\n")}</pre>
+        </details>
       )}
     </div>
   );
