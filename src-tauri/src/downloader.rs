@@ -20,12 +20,13 @@ pub struct EngineResult {
     pub stderr_tail: String,
 }
 
-/// Run the engine process: stream stdout line-by-line into `on_line`,
+/// Run the engine process: stream stdout AND stderr line-by-line into
+/// `on_line` while it runs (slow retries must be visible, not silent),
 /// capture the stderr tail, and report the exit status.
-pub fn run_engine(
-    cmd: &mut Command,
-    on_line: &mut dyn FnMut(&str),
-) -> std::io::Result<EngineResult> {
+pub fn run_engine<F>(cmd: &mut Command, on_line: &mut F) -> std::io::Result<EngineResult>
+where
+    F: FnMut(&str) + Send,
+{
     use std::process::Stdio;
     // freshly-written scripts can transiently refuse exec with ETXTBSY
     // (write-exclusion lingers a beat after fs::write returns); retry briefly
@@ -43,11 +44,17 @@ pub fn run_engine(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    let stderr_handle = std::thread::spawn(move || {
-        let mut tail = String::new();
-        let mut lines = Vec::new();
-        for line in BufReader::new(stderr).lines() {
-            if let Ok(line) = line {
+    // stderr reader and stdout reader both call the same parser; the lock is
+    // held only for the callback, which is cheap (parse + emit)
+    let shared = std::sync::Mutex::new(on_line);
+
+    let (status, stderr_tail) = std::thread::scope(|scope| -> std::io::Result<_> {
+        let stderr_handle = scope.spawn(|| {
+            let mut tail = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut cb) = shared.lock() {
+                    cb(&line);
+                }
                 tail.push_str(&line);
                 tail.push('\n');
                 let excess = tail.len().saturating_sub(STDERR_TAIL_LIMIT);
@@ -59,23 +66,19 @@ pub fn run_engine(
                     }
                     tail = tail[excess..].to_string();
                 }
-                lines.push(line);
+            }
+            tail
+        });
+
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(mut cb) = shared.lock() {
+                cb(&line);
             }
         }
-        (tail, lines)
-    });
-
-    for line in BufReader::new(stdout).lines() {
-        if let Ok(line) = line {
-            on_line(&line);
-        }
-    }
-    let status = child.wait()?;
-    let (stderr_tail, stderr_lines) = stderr_handle.join().unwrap_or_default();
-    // yt-dlp writes ERROR: text on stderr; the caller's parser sees both streams
-    for line in &stderr_lines {
-        on_line(line);
-    }
+        let status = child.wait()?;
+        let tail = stderr_handle.join().unwrap_or_default();
+        Ok((status, tail))
+    })?;
 
     Ok(EngineResult {
         ok: status.success(),
@@ -91,6 +94,8 @@ pub struct EngineConfig {
     pub engine_dir: Option<String>,
     pub save_path: Option<String>,
     pub cookie_file: Option<String>,
+    /// "none" | "chrome" | "file"; None behaves as "chrome" for back-compat.
+    pub cookie_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +155,13 @@ pub fn classify_is_cookie_issue(stderr_tail: &str) -> bool {
         .any(|m| stderr_tail.to_ascii_lowercase().contains(m))
 }
 
+/// Cookies are optional: when the chrome-cookie attempt fails for a
+/// cookie-shaped reason, the download is retried once with no cookies at all
+/// rather than surfacing a hard failure.
+pub fn should_retry_without_cookies(used_chrome: bool, ok: bool, stderr_tail: &str) -> bool {
+    used_chrome && !ok && classify_is_cookie_issue(stderr_tail)
+}
+
 /// Peel `ERROR: …` down to the human-readable message (bot-check text etc).
 pub fn parse_error_line(line: &str) -> Option<String> {
     let mut msg = line.strip_prefix("ERROR: ")?.trim().to_string();
@@ -180,7 +192,8 @@ pub fn parse_error_line(line: &str) -> Option<String> {
 /// what `--print after_move:filepath` emits — the final file on disk.
 pub fn parse_final_file(line: &str) -> Option<String> {
     let t = line.trim();
-    if t.is_empty() || t.starts_with('[') || t.starts_with("ERROR:") {
+    const NON_PATH: [&str; 3] = ["ERROR:", "WARNING", "Deprecated"];
+    if t.is_empty() || t.starts_with('[') || NON_PATH.iter().any(|p| t.starts_with(p)) {
         return None;
     }
     Some(t.to_string())
@@ -203,7 +216,8 @@ pub fn build_args(config: &EngineConfig, url: &str, mode: DownloadMode) -> Vec<S
     }
     if let Some(file) = &config.cookie_file {
         args.extend(["--cookies".to_string(), file.clone()]);
-    } else {
+    } else if config.cookie_mode.as_deref() != Some("none") {
+        // default remains chrome (best bot-check resilience); "none" disables
         args.extend(["--cookies-from-browser".to_string(), "chrome".to_string()]);
     }
     if let Some(dir) = &config.save_path {
@@ -232,6 +246,7 @@ mod final_file_tests {
             engine_dir: None,
             save_path: None,
             cookie_file: None,
+            cookie_mode: None,
         }
     }
 
@@ -256,6 +271,10 @@ mod final_file_tests {
         assert_eq!(parse_final_file(""), None);
         assert_eq!(parse_final_file("[youtube] abc: fetching"), None);
         assert_eq!(parse_final_file("ERROR: Sign in to confirm"), None);
+        assert_eq!(
+            parse_final_file("WARNING: [youtube] Read timed out, retrying"),
+            None
+        );
     }
 }
 
@@ -371,6 +390,26 @@ mod runner_tests {
     }
 
     #[test]
+    fn stderr_streams_live_before_child_exits() {
+        // a warning emitted mid-run must surface before the final stdout line,
+        // otherwise the UI sits silent during slow YouTube retries
+        let script = fixture_script(
+            "echo 'WARNING: Read timed out, retrying' >&2; sleep 0.3; echo 'late-stdout'",
+        );
+        let mut lines = Vec::new();
+        run_engine(&mut Command::new(&script), &mut |line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        let warn = lines
+            .iter()
+            .position(|l| l.contains("Read timed out"))
+            .unwrap();
+        let late = lines.iter().position(|l| l == "late-stdout").unwrap();
+        assert!(warn < late, "stderr must stream live, got {:?}", lines);
+    }
+
+    #[test]
     fn multibyte_stderr_tail_does_not_panic() {
         // Cyrillic (2-byte chars) crossing the tail limit must not slice a
         // UTF-8 boundary when trimming
@@ -415,7 +454,6 @@ mod classify_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod args_tests {
     use super::*;
 
@@ -425,6 +463,17 @@ mod args_tests {
             engine_dir: None,
             save_path: save.map(|s| s.to_string()),
             cookie_file: cookie.map(|s| s.to_string()),
+            cookie_mode: None,
+        }
+    }
+
+    fn config_with_mode(mode: Option<&str>, cookie: Option<&str>) -> EngineConfig {
+        EngineConfig {
+            engine_path: PathBuf::from("/fake/engine"),
+            engine_dir: None,
+            save_path: None,
+            cookie_file: cookie.map(|s| s.to_string()),
+            cookie_mode: mode.map(|s| s.to_string()),
         }
     }
 
@@ -455,6 +504,7 @@ mod args_tests {
             engine_dir: Some("/bundle/engine".into()),
             save_path: None,
             cookie_file: None,
+            cookie_mode: None,
         };
         let args = build_args(&cfg, "u", DownloadMode::Video);
         let i = args.iter().position(|a| a == "--ffmpeg-location").unwrap();
@@ -468,9 +518,85 @@ mod args_tests {
             engine_dir: None,
             save_path: None,
             cookie_file: None,
+            cookie_mode: None,
         };
         let args = build_args(&cfg, "u", DownloadMode::Video);
         assert!(!args.contains(&"--ffmpeg-location".to_string()));
+    }
+
+    #[test]
+    fn cookie_mode_none_adds_no_cookie_flags() {
+        let args = build_args(
+            &config_with_mode(Some("none"), None),
+            "u",
+            DownloadMode::Audio,
+        );
+        assert!(!args.contains(&"--cookies".to_string()));
+        assert!(!args.contains(&"--cookies-from-browser".to_string()));
+    }
+
+    #[test]
+    fn cookie_mode_chrome_uses_browser_flag() {
+        let args = build_args(
+            &config_with_mode(Some("chrome"), None),
+            "u",
+            DownloadMode::Audio,
+        );
+        let i = args
+            .iter()
+            .position(|a| a == "--cookies-from-browser")
+            .unwrap();
+        assert_eq!(args[i + 1], "chrome");
+    }
+
+    #[test]
+    fn cookie_mode_unset_defaults_to_chrome() {
+        let args = build_args(&config_with_mode(None, None), "u", DownloadMode::Audio);
+        assert!(args.contains(&"--cookies-from-browser".to_string()));
+    }
+
+    #[test]
+    fn cookie_file_wins_over_mode() {
+        let args = build_args(
+            &config_with_mode(Some("chrome"), Some("/tmp/cookies.txt")),
+            "u",
+            DownloadMode::Audio,
+        );
+        let i = args.iter().position(|a| a == "--cookies").unwrap();
+        assert_eq!(args[i + 1], "/tmp/cookies.txt");
+        assert!(!args.contains(&"--cookies-from-browser".to_string()));
+    }
+
+    #[test]
+    fn retries_without_cookies_on_chrome_cookie_failure() {
+        assert!(should_retry_without_cookies(
+            true,
+            false,
+            "ERROR: could not copy chrome cookie database: database is locked"
+        ));
+    }
+
+    #[test]
+    fn no_retry_when_already_succeeded() {
+        assert!(!should_retry_without_cookies(true, true, ""));
+    }
+
+    #[test]
+    fn no_retry_on_unrelated_failure() {
+        assert!(!should_retry_without_cookies(
+            true,
+            false,
+            "ERROR: Video unavailable"
+        ));
+    }
+
+    #[test]
+    fn no_retry_when_cookies_were_not_chrome() {
+        assert!(!should_retry_without_cookies(
+            false,
+            false,
+            "ERROR: could not copy chrome cookie database"
+        ));
     }
 
     #[test]

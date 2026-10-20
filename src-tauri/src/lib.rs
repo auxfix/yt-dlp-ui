@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use downloader::{
     build_args, classify_is_cookie_issue, parse_error_line, parse_final_file, parse_progress_line,
-    run_engine, DownloadMode, EngineConfig,
+    run_engine, should_retry_without_cookies, DownloadMode, EngineConfig,
 };
 use history::{HistoryEntry, HistoryStore};
 use serde::Serialize;
@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod downloader;
 mod engine;
+mod health;
 mod history;
 mod settings;
 mod updater;
@@ -39,9 +40,51 @@ enum DownloadEvent {
         stderr_tail: String,
         cookie_issue: bool,
     },
+    /// Non-progress engine narrative (warnings, retries) for the live log.
+    Log {
+        line: String,
+    },
 }
 
 const EVENT: &str = "download-event";
+
+/// Default value for a WebKitGTK env knob, applied only when the user hasn't
+/// set it: disabling the DMA-BUF renderer avoids the Wayland crash
+/// `Gdk-Message: Error 71 (Protocol error)`, verified on real GPUs.
+fn env_default_if_absent(current: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    current.is_none().then_some("1")
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_webkit_defaults() {
+    const KEY: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    let current = std::env::var_os(KEY);
+    if let Some(value) = env_default_if_absent(current.as_deref()) {
+        // SAFETY: called once at process start, before any threads exist
+        unsafe {
+            std::env::set_var(KEY, value);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_linux_webkit_defaults() {}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn renderer_fix_applies_only_when_unset() {
+        assert_eq!(env_default_if_absent(None), Some("1"));
+        assert_eq!(
+            env_default_if_absent(Some(OsStr::new("0"))),
+            None,
+            "explicit user setting must win"
+        );
+    }
+}
 
 fn engine_file_name() -> &'static str {
     if cfg!(windows) {
@@ -74,30 +117,73 @@ struct EngineInfo {
     origin: String,
 }
 
+/// Resolve the engine actually used for downloads: settings override first,
+/// then the auto chain. Returns the binary and its directory (siblings live
+/// there when the engine is bundled/overridden to a real file).
+fn resolved_engine(
+    app: &AppHandle,
+    settings: &Settings,
+) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    let override_path = settings
+        .engine_path
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    let resolved = override_path.or_else(|| match current_engine(app) {
+        engine::EngineOrigin::User(p) => Some(p),
+        engine::EngineOrigin::Bundled(p) => Some(p),
+        engine::EngineOrigin::Path(_) => None,
+    });
+    match resolved {
+        Some(p) => {
+            let dir = p.parent().map(|d| d.to_path_buf());
+            (p, dir)
+        }
+        None => (std::path::PathBuf::from("yt-dlp"), None),
+    }
+}
+
 #[tauri::command]
-fn engine_version(app: AppHandle) -> EngineInfo {
+fn engine_version(app: AppHandle, state: State<AppState>) -> EngineInfo {
     use std::process::Stdio;
-    let engine = current_engine(&app);
-    let mut invocation = match &engine {
-        engine::EngineOrigin::User(p) => std::process::Command::new(p),
-        engine::EngineOrigin::Bundled(p) => std::process::Command::new(p),
-        engine::EngineOrigin::Path(s) => std::process::Command::new(s),
-    };
+    let settings = state.store.lock().unwrap().load();
+    let (engine_path, _) = resolved_engine(&app, &settings);
+    let mut invocation = std::process::Command::new(&engine_path);
     invocation.arg("--version").stdout(Stdio::piped());
     let version = invocation
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|v| !v.is_empty());
-    let origin = match engine {
-        engine::EngineOrigin::User(_) => "user",
-        engine::EngineOrigin::Bundled(_) => "bundled",
-        engine::EngineOrigin::Path(_) => "path",
+    let origin = if settings
+        .engine_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        "override"
+    } else {
+        match current_engine(&app) {
+            engine::EngineOrigin::User(_) => "user",
+            engine::EngineOrigin::Bundled(_) => "bundled",
+            engine::EngineOrigin::Path(_) => "path",
+        }
     };
     EngineInfo {
         version,
         origin: origin.to_string(),
     }
+}
+
+/// Preflight: complain about missing engine pieces before a download starts.
+#[tauri::command(async)]
+fn health_check(app: AppHandle, state: State<AppState>) -> health::HealthReport {
+    let settings = state.store.lock().unwrap().load();
+    let (engine_path, engine_dir) = resolved_engine(&app, &settings);
+    let components = match engine_dir {
+        Some(dir) => health::bundled_components(&engine_path, &dir),
+        None => health::path_components(&std::env::var_os("PATH").unwrap_or_default()),
+    };
+    health::HealthReport::from_components(components)
 }
 
 #[tauri::command(async)]
@@ -205,94 +291,118 @@ fn start_download(
         }
     };
     let settings = state.store.lock().unwrap().load();
-    let engine_override = settings
-        .engine_path
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .map(std::path::PathBuf::from);
-    let engine_path = engine_override.or_else(|| match current_engine(&app) {
-        engine::EngineOrigin::User(p) => Some(p),
-        engine::EngineOrigin::Bundled(p) => Some(p),
-        engine::EngineOrigin::Path(_) => None,
-    });
-    let engine_dir = engine_path
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_string_lossy().to_string());
-    let engine_path = engine_path.unwrap_or_else(|| std::path::PathBuf::from("yt-dlp"));
-    let config = EngineConfig {
+    let (engine_path, engine_dir) = resolved_engine(&app, &settings);
+    let mut config = EngineConfig {
         engine_path,
-        engine_dir,
+        engine_dir: engine_dir.map(|p| p.to_string_lossy().to_string()),
         save_path: settings.save_path,
         cookie_file: settings.cookie_file,
+        cookie_mode: settings.cookie_mode,
     };
-    let args = build_args(&config, &url, dmode);
 
     let app = app.clone();
     let running = state.running.clone();
     let history = state.history.clone();
     std::thread::spawn(move || {
         let _ = app.emit(EVENT, DownloadEvent::Started { url: url.clone() });
-        let mut last_error: Option<String> = None;
-        let mut final_file: Option<String> = None;
+        let mut last_error: Option<String>;
+        let mut final_file: Option<String>;
 
-        let mut cmd = std::process::Command::new(&config.engine_path);
-        cmd.args(&args);
-        // bundled siblings (ffmpeg/ffprobe/deno) must be findable by the
-        // engine subprocesses; Tauri app bundles don't carry them on PATH
-        if let Some(dir) = &config.engine_dir {
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            let current = std::env::var_os("PATH").unwrap_or_default();
-            let mut paths = vec![std::path::PathBuf::from(dir)];
-            paths.extend(std::env::split_paths(&current));
-            cmd.env(
-                "PATH",
-                std::env::join_paths(&paths)
-                    .unwrap_or_else(|_| std::ffi::OsString::from(format!("{dir}{sep}"))),
-            );
-        }
-        let result = run_engine(&mut cmd, &mut |line| {
-            if let Some(p) = parse_progress_line(line) {
-                let _ = app.emit(
-                    EVENT,
-                    DownloadEvent::Progress {
-                        pct: p.pct,
-                        speed: p.speed,
-                        eta: p.eta,
-                    },
+        // cookies are optional: if the chrome attempt fails for a cookie reason,
+        // retry exactly once with no cookies before surfacing the failure
+        let mut used_chrome =
+            config.cookie_file.is_none() && config.cookie_mode.as_deref() != Some("none");
+        let mut retried_without_cookies = false;
+
+        let handle = 'attempts: loop {
+            last_error = None;
+            final_file = None;
+            let args = build_args(&config, &url, dmode);
+
+            let mut cmd = std::process::Command::new(&config.engine_path);
+            cmd.args(&args);
+            // bundled siblings (ffmpeg/ffprobe/deno) must be findable by the
+            // engine subprocesses; Tauri app bundles don't carry them on PATH
+            if let Some(dir) = &config.engine_dir {
+                let sep = if cfg!(windows) { ";" } else { ":" };
+                let current = std::env::var_os("PATH").unwrap_or_default();
+                let mut paths = vec![std::path::PathBuf::from(dir)];
+                paths.extend(std::env::split_paths(&current));
+                cmd.env(
+                    "PATH",
+                    std::env::join_paths(&paths)
+                        .unwrap_or_else(|_| std::ffi::OsString::from(format!("{dir}{sep}"))),
                 );
             }
-            if let Some(err) = parse_error_line(line) {
-                last_error = Some(err);
-            }
-            if let Some(file) = parse_final_file(line) {
-                final_file = Some(file);
-            }
-        });
-
-        let handle = match result {
-            Ok(r) => r,
-            // spawn error: likely no engine on PATH yet (packaged in milestone 5)
-            Err(e) => {
-                running.store(false, Ordering::SeqCst);
-                history.append(&history_entry(
-                    &url,
-                    &mode,
-                    false,
-                    "could not start engine",
-                    None,
-                ));
+            let result = run_engine(&mut cmd, &mut |line| {
+                if let Some(p) = parse_progress_line(line) {
+                    let _ = app.emit(
+                        EVENT,
+                        DownloadEvent::Progress {
+                            pct: p.pct,
+                            speed: p.speed,
+                            eta: p.eta,
+                        },
+                    );
+                    return;
+                }
+                // everything else is narrative: show it live in the engine log
                 let _ = app.emit(
                     EVENT,
-                    DownloadEvent::Finished {
-                        ok: false,
-                        message: format!("could not start engine: {e}"),
-                        stderr_tail: format!("could not start engine: {e}"),
-                        cookie_issue: false,
+                    DownloadEvent::Log {
+                        line: line.to_string(),
                     },
                 );
-                return;
+                if let Some(err) = parse_error_line(line) {
+                    last_error = Some(err);
+                }
+                if let Some(file) = parse_final_file(line) {
+                    final_file = Some(file);
+                }
+            });
+
+            let handle = match result {
+                Ok(r) => r,
+                // spawn error: engine binary missing / not executable
+                Err(e) => {
+                    running.store(false, Ordering::SeqCst);
+                    history.append(&history_entry(
+                        &url,
+                        &mode,
+                        false,
+                        "could not start engine",
+                        None,
+                    ));
+                    let _ = app.emit(
+                        EVENT,
+                        DownloadEvent::Finished {
+                            ok: false,
+                            message: format!("could not start engine: {e}"),
+                            stderr_tail: format!("could not start engine: {e}"),
+                            cookie_issue: false,
+                        },
+                    );
+                    return;
+                }
+            };
+
+            if should_retry_without_cookies(used_chrome, handle.ok, &handle.stderr_tail)
+                && !retried_without_cookies
+            {
+                retried_without_cookies = true;
+                used_chrome = false;
+                config.cookie_file = None;
+                config.cookie_mode = Some("none".to_string());
+                let _ = app.emit(
+                    EVENT,
+                    DownloadEvent::Log {
+                        line: "Chrome cookies unavailable — retrying without cookies".to_string(),
+                    },
+                );
+                continue 'attempts;
             }
+
+            break 'attempts handle;
         };
 
         let message = if handle.ok {
@@ -318,6 +428,7 @@ fn start_download(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    apply_linux_webkit_defaults();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -345,6 +456,7 @@ pub fn run() {
             get_history,
             start_download,
             engine_version,
+            health_check,
             update_engine
         ])
         .run(tauri::generate_context!())

@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub save_path: Option<String>,
     pub cookie_file: Option<String>,
+    /// "none" | "chrome" | "file"; absent (legacy) behaves as chrome.
+    #[serde(default)]
+    pub cookie_mode: Option<String>,
     /// Manual engine-binary override; empty string means "auto chain".
     #[serde(default)]
     pub engine_path: Option<String>,
@@ -109,5 +112,17 @@ mod tests {
         store.save(&s);
         let reloaded = SettingsStore::new(&path).load();
         assert_eq!(reloaded.engine_path.as_deref(), Some("/opt/newest/yt-dlp"));
+    }
+
+    #[test]
+    fn cookie_mode_persists_and_defaults_to_chrome_semantics() {
+        let path = temp_dir("cookie_mode");
+        let store = SettingsStore::new(&path);
+        let mut s = store.load();
+        assert_eq!(s.cookie_mode, None); // caller treats None as chrome
+        s.cookie_mode = Some("none".into());
+        store.save(&s);
+        let reloaded = SettingsStore::new(&path).load();
+        assert_eq!(reloaded.cookie_mode.as_deref(), Some("none"));
     }
 }
