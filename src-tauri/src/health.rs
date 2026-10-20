@@ -109,6 +109,87 @@ pub fn path_components(path_var: &OsStr) -> Vec<ComponentHealth> {
         .collect()
 }
 
+/// yt-dlp's `--version` output is a date-like tag, e.g. "2026.10.10.233141".
+/// Anything else (deno, ffmpeg, a half-written script) must be rejected as
+/// the engine, not just "file exists".
+pub fn looks_like_ytdlp(version_output: &str) -> bool {
+    let first = version_output.lines().next().unwrap_or("").trim();
+    let mut parts = first.split('.');
+    let year = parts.next().unwrap_or("");
+    let (Some(month), Some(day)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    year.len() == 4
+        && year.chars().all(|c| c.is_ascii_digit())
+        && month.chars().all(|c| c.is_ascii_digit())
+        && day.chars().all(|c| c.is_ascii_digit())
+        && !month.is_empty()
+        && !day.is_empty()
+}
+
+/// Run `<engine> --version` with a hard timeout (a wrong binary may hang).
+/// Returns the trimmed stdout on success.
+pub fn probe_engine_version(path: &Path, timeout: std::time::Duration) -> Option<String> {
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let out = child.wait_with_output().ok()?;
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return (!text.is_empty()).then_some(text);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Full report for the resolved engine: binary presence + identity probe.
+/// A file that merely exists and is executable (deno, ffmpeg, a stub script)
+/// must not pass as yt-dlp.
+pub fn verified_engine_components(
+    engine_path: &Path,
+    engine_dir: Option<&Path>,
+) -> Vec<ComponentHealth> {
+    let mut comps = match engine_dir {
+        Some(dir) => bundled_components(engine_path, dir),
+        None => path_components(&std::env::var_os("PATH").unwrap_or_default()),
+    };
+    let probe = probe_engine_version(engine_path, std::time::Duration::from_secs(3));
+    if let Some(engine) = comps.iter_mut().find(|c| c.name == "yt-dlp") {
+        match probe {
+            Some(v) if looks_like_ytdlp(&v) => {
+                engine.ok = true;
+                engine.detail = v;
+            }
+            Some(v) => {
+                engine.ok = false;
+                engine.detail = format!("not yt-dlp (reported: {v})");
+            }
+            None => {
+                engine.ok = false;
+                engine.detail =
+                    format!("engine did not answer --version: {}", engine_path.display());
+            }
+        }
+    }
+    comps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +289,67 @@ mod tests {
         let comps = bundled_components(&dir.join(binary_name("yt-dlp")), &dir);
         assert!(comps.iter().find(|c| c.name == "ffmpeg").unwrap().ok);
         assert!(!comps.iter().find(|c| c.name == "deno").unwrap().ok);
+    }
+
+    #[test]
+    fn recognizes_ytdlp_version_output() {
+        assert!(looks_like_ytdlp("2026.10.10.233141"));
+        assert!(looks_like_ytdlp("2026.10.10.233141\n"));
+        assert!(!looks_like_ytdlp("deno 2.9.7"));
+        assert!(!looks_like_ytdlp("ffmpeg version N-127654"));
+        assert!(!looks_like_ytdlp(""));
+    }
+
+    #[cfg(unix)]
+    fn fake_engine(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("engine_under_test");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reads_version_from_engine() {
+        let dir = temp_dir("probe_ok");
+        let engine = fake_engine(&dir, "echo 2026.10.10.233141");
+        let v = probe_engine_version(&engine, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(v, "2026.10.10.233141");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_times_out_on_hanging_binary() {
+        let dir = temp_dir("probe_hang");
+        let engine = fake_engine(&dir, "sleep 10");
+        let v = probe_engine_version(&engine, std::time::Duration::from_millis(150));
+        assert_eq!(v, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deno_selected_as_engine_is_flagged_not_ytdlp() {
+        let dir = temp_dir("deno_as_engine");
+        let engine = fake_engine(&dir, "echo 'deno 2.9.7'");
+        make_exec(&dir.join(binary_name("ffmpeg")));
+        let comps = verified_engine_components(&engine, Some(&dir));
+        let ytdlp = comps.iter().find(|c| c.name == "yt-dlp").unwrap();
+        assert!(!ytdlp.ok, "deno must not pass as the engine");
+        assert!(ytdlp.detail.contains("deno"), "detail was {}", ytdlp.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_ytdlp_override_passes_verification() {
+        let dir = temp_dir("real_engine");
+        let engine = fake_engine(&dir, "echo 2026.10.10.233141");
+        make_exec(&dir.join(binary_name("ffmpeg")));
+        make_exec(&dir.join(binary_name("ffprobe")));
+        make_exec(&dir.join(binary_name("deno")));
+        let comps = verified_engine_components(&engine, Some(&dir));
+        assert!(comps.iter().all(|c| c.ok), "got {:?}", comps);
     }
 }

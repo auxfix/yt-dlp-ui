@@ -344,7 +344,13 @@ mod runner_tests {
         })
         .unwrap();
         assert_eq!(lines.len(), 3); // 2 stdout + stderr fed to callback too
-        assert_eq!(lines[0], "[download]  1.0% of 1MB");
+        // stdout/stderr interleave freely now (live streaming); only the
+        // relative order within one stream is guaranteed
+        let download_lines: Vec<&String> =
+            lines.iter().filter(|l| l.starts_with("[download]")).collect();
+        assert_eq!(download_lines.len(), 2);
+        assert!(download_lines[0].contains("1.0%"));
+        assert!(download_lines[1].contains("100%"));
         assert!(lines.iter().any(|l| l == "err"));
         assert!(result.ok);
         assert!(result.stderr_tail.contains("err"));

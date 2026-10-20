@@ -179,10 +179,8 @@ fn engine_version(app: AppHandle, state: State<AppState>) -> EngineInfo {
 fn health_check(app: AppHandle, state: State<AppState>) -> health::HealthReport {
     let settings = state.store.lock().unwrap().load();
     let (engine_path, engine_dir) = resolved_engine(&app, &settings);
-    let components = match engine_dir {
-        Some(dir) => health::bundled_components(&engine_path, &dir),
-        None => health::path_components(&std::env::var_os("PATH").unwrap_or_default()),
-    };
+    let components =
+        health::verified_engine_components(&engine_path, engine_dir.as_deref());
     health::HealthReport::from_components(components)
 }
 
