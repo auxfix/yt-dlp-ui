@@ -88,51 +88,15 @@ body,
 
 body {
   overflow-x: hidden;
-  background: var(--bg);
+  /* static layered gradients: painted once, no animated blur layers */
+  background:
+    radial-gradient(900px 520px at 85% -12%, var(--bg-glow-1), transparent 65%),
+    radial-gradient(820px 480px at -12% 112%, var(--bg-glow-2), transparent 65%),
+    radial-gradient(640px 420px at 50% 42%, var(--bg-glow-3), transparent 70%),
+    var(--bg);
   color: var(--text);
   user-select: none;
-  transition: background 0.4s ease, color 0.3s ease;
-}
-
-/* soft, animated color blobs behind the app */
-body::before,
-body::after {
-  content: "";
-  position: fixed;
-  z-index: 0;
-  border-radius: 50%;
-  filter: blur(90px);
-  pointer-events: none;
-  opacity: 0.9;
-  transition: background 0.5s ease;
-}
-
-body::before {
-  width: 60vw;
-  height: 60vw;
-  top: -18vw;
-  left: -12vw;
-  background: radial-gradient(circle, var(--bg-glow-1), transparent 60%);
-  animation: drift-a 26s ease-in-out infinite alternate;
-}
-
-body::after {
-  width: 55vw;
-  height: 55vw;
-  bottom: -20vw;
-  right: -14vw;
-  background: radial-gradient(circle, var(--bg-glow-2), transparent 60%);
-  animation: drift-b 32s ease-in-out infinite alternate;
-}
-
-@keyframes drift-a {
-  from { transform: translate(0, 0) scale(1); }
-  to   { transform: translate(6vw, 4vh) scale(1.1); }
-}
-
-@keyframes drift-b {
-  from { transform: translate(0, 0) scale(1.05); }
-  to   { transform: translate(-6vw, -4vh) scale(0.95); }
+  transition: color 0.3s ease;
 }
 
 /* ── app shell & layout ─────────────────────────────────── */
@@ -179,12 +143,6 @@ body::after {
     linear-gradient(135deg, var(--accent), var(--accent-3));
   border-radius: 14px;
   box-shadow: 0 8px 22px rgba(255, 61, 110, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.3);
-  animation: mark-glow 4s ease-in-out infinite;
-}
-
-@keyframes mark-glow {
-  0%, 100% { box-shadow: 0 8px 22px rgba(255, 61, 110, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.3); }
-  50%      { box-shadow: 0 8px 30px rgba(168, 85, 247, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.3); }
 }
 
 .brand-text {
@@ -249,8 +207,6 @@ body::after {
   border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: var(--shadow-sm);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
 }
 
 .tabs [role="tab"] {
@@ -275,18 +231,7 @@ body::after {
 .tabs [role="tab"].active {
   color: var(--accent-contrast);
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  box-shadow: 0 6px 18px rgba(255, 61, 110, 0.4);
-}
-
-/* subtle sheen sweep on the active tab */
-.tabs [role="tab"].active::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.18) 50%, transparent 80%);
-  transform: translateX(-100%);
-  animation: sheen 2.8s ease-in-out infinite;
-  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(255, 61, 110, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 @keyframes sheen {
@@ -326,35 +271,16 @@ input:focus-visible {
 }
 
 .card {
-  position: relative;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 18px;
   padding: 20px;
-  box-shadow: var(--shadow-sm);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
-}
-
-.card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(160deg, var(--border-strong), transparent 40%);
-  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  opacity: 0.7;
-  pointer-events: none;
+  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
 .card:hover {
   border-color: var(--border-strong);
-  box-shadow: var(--shadow);
   transform: translateY(-2px);
 }
 
@@ -429,19 +355,18 @@ button.primary {
   box-shadow: 0 8px 22px rgba(255, 61, 110, 0.4);
 }
 
-button.primary:hover:not(:disabled) {
-  filter: brightness(1.06);
-  box-shadow: 0 10px 28px rgba(255, 61, 110, 0.5);
-}
-
 button.primary::after {
   content: "";
   position: absolute;
   inset: 0;
   background: linear-gradient(100deg, transparent 25%, rgba(255, 255, 255, 0.25) 50%, transparent 75%);
   transform: translateX(-100%);
-  animation: sheen 3.2s ease-in-out infinite;
   pointer-events: none;
+}
+
+/* one-shot shine on hover instead of a perpetual animation */
+button.primary:hover:not(:disabled)::after {
+  animation: sheen 0.7s ease-out;
 }
 
 /* ── download tab ───────────────────────────────────────── */
@@ -531,15 +456,6 @@ button.primary::after {
   background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
   box-shadow: 0 0 16px rgba(255, 61, 110, 0.55);
   transition: width 0.25s ease;
-}
-
-.progress-fill::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.35) 50%, transparent 80%);
-  transform: translateX(-100%);
-  animation: sheen 1.6s ease-in-out infinite;
 }
 
 .progress-fill.indeterminate {
@@ -667,12 +583,11 @@ details pre {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 14px;
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  transition: border-color 0.18s ease, transform 0.18s ease;
 }
 
 .history-row:hover {
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-sm);
   transform: translateX(3px);
 }
 

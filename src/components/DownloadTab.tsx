@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -37,6 +37,10 @@ interface LogPayload {
 
 type Payload = StartPayload | ProgressPayload | FinishedPayload | LogPayload;
 
+// yt-dlp emits a progress line per chunk. Cap React updates to ~10/s so a
+// fast download cannot starve the UI thread.
+const PROGRESS_THROTTLE_MS = 100;
+
 const LOG_LIMIT = 60;
 
 export default function DownloadTab({ blocked = false }: { blocked?: boolean }) {
@@ -46,37 +50,82 @@ export default function DownloadTab({ blocked = false }: { blocked?: boolean }) 
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState<{ message: string; stderrTail: string } | null>(null);
   const [cookieBanner, setCookieBanner] = useState(false);
+
+  const lastProgressAt = useRef(0);
+  const pendingProgress = useRef<Progress | null>(null);
+  const flushTimer = useRef<number | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+
+    const clearFlush = () => {
+      if (flushTimer.current !== null) {
+        window.clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+    };
+
     listen<Payload>("download-event", (e) => {
       const p = e.payload;
       switch (p.type) {
         case "started":
+          clearFlush();
+          pendingProgress.current = null;
+          lastProgressAt.current = 0;
           setStatus("running");
           setProgress(null);
           setError(null);
           setCookieBanner(false);
+          setLogLines([]);
           break;
-        case "progress":
-          setProgress({ pct: p.pct, speed: p.speed, eta: p.eta });
+        case "progress": {
+          // leading edge applies immediately; the rest of the burst is
+          // coalesced into one trailing update per throttle window
+          const next = { pct: p.pct, speed: p.speed, eta: p.eta };
+          pendingProgress.current = next;
+          const now = performance.now();
+          if (now - lastProgressAt.current >= PROGRESS_THROTTLE_MS) {
+            lastProgressAt.current = now;
+            setProgress(next);
+          } else if (flushTimer.current === null) {
+            flushTimer.current = window.setTimeout(() => {
+              flushTimer.current = null;
+              lastProgressAt.current = performance.now();
+              if (pendingProgress.current) {
+                setProgress(pendingProgress.current);
+              }
+            }, PROGRESS_THROTTLE_MS);
+          }
           break;
-        case "log":
-          setLogLines((lines) => [...lines, p.line].slice(-LOG_LIMIT));
-          break;
+        }
         case "finished":
+          clearFlush();
+          pendingProgress.current = null;
           setStatus(p.ok ? "done" : "error");
           if (!p.ok) {
             setError({ message: p.message, stderrTail: p.stderrTail });
             setCookieBanner(p.cookieIssue);
           }
           break;
+        case "log":
+          // keep only the tail so long downloads don't grow unbounded
+          setLogLines((lines) => {
+            const next = [...lines, p.line];
+            return next.length > LOG_LIMIT
+              ? next.slice(next.length - LOG_LIMIT)
+              : next;
+          });
+          break;
       }
     }).then((fn) => {
       unlisten = fn;
     });
-    return () => unlisten?.();
+
+    return () => {
+      clearFlush();
+      unlisten?.();
+    };
   }, []);
 
   const start = () => {

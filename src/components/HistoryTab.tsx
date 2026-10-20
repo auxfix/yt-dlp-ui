@@ -10,9 +10,14 @@ export interface HistoryEntry {
   filePath: string | null;
 }
 
+// hoisted: building a formatter per row per render is needless work
+const WHEN_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
 function fmtTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toLocaleString();
+  return WHEN_FORMATTER.format(ts);
 }
 
 export default function HistoryTab() {
